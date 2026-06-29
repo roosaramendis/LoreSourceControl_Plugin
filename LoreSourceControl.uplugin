@@ -1,0 +1,17 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Lore Source Control",
+    "Description": "Integrates Lore version control into Unreal Editor.",
+    "Category": "Source Control",
+    "CreatedBy": "Me",
+    "CanContainContent": false,
+    "Modules": [
+        {
+            "Name": "LoreSourceControl",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ]
+}
