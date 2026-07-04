@@ -11,7 +11,7 @@ class FLoreSourceControlProvider : public ISourceControlProvider
 {
 public:
     FLoreSourceControlProvider();
-
+    
     virtual const FName& GetName() const override;
     virtual void Init(bool bForceConnection = true) override;
     virtual void Close() override;
@@ -89,9 +89,11 @@ public:
 
     FString RunLoreCommand(const TArray<FString>& Args) const;
     void SetConnected(bool bConnected) { bIsConnected = bConnected; }
+    void ShowReconnectNotification();
 private:
     FName ProviderName;
     bool bIsConnected = false;
+    bool bPendingStartupCheck = false;
     FString StatusMessage;
     FSourceControlStateChanged OnSourceControlStateChanged;
 

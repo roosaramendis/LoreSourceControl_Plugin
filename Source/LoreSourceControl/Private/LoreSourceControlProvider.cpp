@@ -6,6 +6,21 @@
 #include "SourceControlOperations.h"
 #include "Misc/ConfigCacheIni.h"
 #include "HAL/PlatformTime.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
+#include "ISourceControlModule.h"
+#include "SourceControlWindows.h"
+#include <signal.h>
+#include "HAL/PlatformFileManager.h"
+#include "Misc/FileHelper.h"
+
+
+static FString NormalizeLorePath(const FString& InPath)
+{
+    FString Abs = FPaths::ConvertRelativePathToFull(InPath);
+    FPaths::NormalizeFilename(Abs);
+    return Abs;
+}
 
 FLoreSourceControlProvider::FLoreSourceControlProvider()
     : ProviderName("Lore")
@@ -19,9 +34,41 @@ const FName& FLoreSourceControlProvider::GetName() const
     return ProviderName;
 }
 
+void FLoreSourceControlProvider::ShowReconnectNotification()
+{
+    // Show a toast notification in the Editor
+    FNotificationInfo Info(FText::FromString(
+        TEXT("Lore Source Control: Not connected. Click to reconnect.")));
+    Info.ExpireDuration = 10.f;
+    Info.bUseSuccessFailIcons = true;
+    Info.bUseLargeFont = false;
+
+    // Add a reconnect button to the notification
+    Info.ButtonDetails.Add(FNotificationButtonInfo(
+        NSLOCTEXT("LoreSC", "ReconnectBtn", "Reconnect"),
+        NSLOCTEXT("LoreSC", "ReconnectTip", "Open source control settings"),
+        FSimpleDelegate::CreateLambda([]()
+        {
+            // Open the source control login dialog
+            ISourceControlModule::Get().ShowLoginDialog(
+                FSourceControlLoginClosed(),
+                ELoginWindowMode::Modeless
+            );
+        })
+    ));
+
+    TSharedPtr<SNotificationItem> Notification =
+        FSlateNotificationManager::Get().AddNotification(Info);
+
+    if (Notification.IsValid())
+    {
+        Notification->SetCompletionState(SNotificationItem::CS_Fail);
+    }
+}
+
 void FLoreSourceControlProvider::Init(bool bForceConnection)
 {
-     // Load saved settings
+    // Load saved settings
     GConfig->GetString(TEXT("LoreSourceControl"),
         TEXT("ServerUrl"), ServerUrl, GEditorSettingsIni);
     GConfig->GetString(TEXT("LoreSourceControl"),
@@ -29,27 +76,20 @@ void FLoreSourceControlProvider::Init(bool bForceConnection)
     GConfig->GetString(TEXT("LoreSourceControl"),
         TEXT("Identity"), Identity, GEditorSettingsIni);
 
-    // Auto-connect if we have saved settings
-    if (!ServerUrl.IsEmpty() && !RepositoryName.IsEmpty())
-    {
-        FString Output = RunLoreCommand({ TEXT("status") });
-        bool bSuccess = Output.Contains(TEXT("Repository"))
-                     && !Output.Contains(TEXT("Error"));
-
-        if (bSuccess)
-        {
-            bIsConnected = true;
-            StatusMessage = FString::Printf(
-                TEXT("Connected to %s/%s"), *ServerUrl, *RepositoryName);
-            UE_LOG(LogTemp, Log,
-                TEXT("LoreSourceControl: Auto-connected to %s/%s"),
-                *ServerUrl, *RepositoryName);
-        }
-    }
-    else
+    if (ServerUrl.IsEmpty())
     {
         StatusMessage = TEXT("Not connected. Configure settings and click Connect.");
+        bIsConnected = false;
+        return;
     }
+
+    // Don't run lore commands here — FPaths::ProjectDir() may not be
+    // fully resolved this early during module startup. Just mark as
+    // "pending" and let Tick() do the real check once the engine has
+    // fully finished loading.
+    bIsConnected = false;
+    StatusMessage = TEXT("Checking connection...");
+    bPendingStartupCheck = true;
 }
 
 void FLoreSourceControlProvider::Close()
@@ -79,10 +119,8 @@ FLoreSourceControlProvider::GetStatus() const
 }
 
 bool FLoreSourceControlProvider::IsEnabled() const   { return true; }
-//bool FLoreSourceControlProvider::IsAvailable() const { return bIsConnected; }
 bool FLoreSourceControlProvider::IsAvailable() const
 {
-   
     return bIsConnected;
 }
 bool FLoreSourceControlProvider::QueryStateBranchConfig(
@@ -113,7 +151,8 @@ ECommandResult::Type FLoreSourceControlProvider::GetState(
 
     for (const FString& File : InFiles)
     {
-        TSharedRef<FLoreSourceControlState>* Cached = StateCache.Find(File);
+        FString NormFile = NormalizeLorePath(File);
+        TSharedRef<FLoreSourceControlState>* Cached = StateCache.Find(NormFile);
         if (Cached)
         {
             OutState.Add(*Cached);
@@ -122,7 +161,7 @@ ECommandResult::Type FLoreSourceControlProvider::GetState(
         {
             // Not in cache yet — create unknown state
             TSharedRef<FLoreSourceControlState> State =
-                MakeShared<FLoreSourceControlState>(File);
+                MakeShared<FLoreSourceControlState>(NormFile);
             State->bIsUnknown = false;
             OutState.Add(State);
         }
@@ -168,8 +207,12 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 {
     FName OpName = InOperation->GetName();
 
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Execute: %s"),
-        *OpName.ToString());
+    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Execute: %s (Files: %d)"),
+        *OpName.ToString(), InFiles.Num());
+    for (const FString& F : InFiles)
+    {
+        UE_LOG(LogTemp, Log, TEXT("LoreSourceControl:   File: %s"), *F);
+    }
 
     ECommandResult::Type Result = ECommandResult::Succeeded;
 
@@ -205,7 +248,7 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
             State->bIsAdded   = true;
             State->bIsUnknown = false;
             State->TimeStamp  = FDateTime::Now();
-            StateCache.Add(File, State);
+            StateCache.Add(NormalizeLorePath(File), State);
         }
 
         OnSourceControlStateChanged.Broadcast();
@@ -248,12 +291,12 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
             State->bIsUnknown  = false;
             State->bIsLocked   = true;
             State->TimeStamp   = FDateTime::Now();
-            StateCache.Add(File, State);
+            StateCache.Add(NormalizeLorePath(File), State);
         }
 
         OnSourceControlStateChanged.Broadcast();
     }
-    
+
     else if (OpName == "CheckIn")
     {
         TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckInOp =
@@ -288,12 +331,12 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
         }
 
         // Commit
-        FString CommitOutput = RunLoreCommand({ TEXT("commit"), Message });
+        FString CommitOutput = RunLoreCommand({ TEXT("commit"), Message, TEXT("--identity"), Identity });
         UE_LOG(LogTemp, Log,
             TEXT("LoreSourceControl: Commit: %s"), *CommitOutput);
 
         // Push
-        FString PushOutput = RunLoreCommand({ TEXT("push") });
+        FString PushOutput = RunLoreCommand({ TEXT("push"), TEXT("--identity"), Identity });
         UE_LOG(LogTemp, Log,
             TEXT("LoreSourceControl: Push: %s"), *PushOutput);
 
@@ -306,11 +349,11 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
             State->bIsUnknown  = false;
             State->bIsLocked   = false;
             State->TimeStamp   = FDateTime::Now();
-            StateCache.Add(File, State);
+            StateCache.Add(NormalizeLorePath(File), State);
         }
         OnSourceControlStateChanged.Broadcast();
     }
-    
+
     else if (OpName == "Revert")
     {
         for (const FString& File : InFiles)
@@ -349,7 +392,7 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
             State->bIsUnknown  = false;
             State->bIsLocked   = false;
             State->TimeStamp   = FDateTime::Now();
-            StateCache.Add(File, State);
+            StateCache.Add(NormalizeLorePath(File), State);
         }
         OnSourceControlStateChanged.Broadcast();
     }
@@ -357,7 +400,7 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
     {
         UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Syncing..."));
 
-        FString SyncOutput = RunLoreCommand({ TEXT("sync") });
+        FString SyncOutput = RunLoreCommand({ TEXT("sync"), TEXT("--identity"), Identity });
         UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Sync: %s"), *SyncOutput);
 
         // Refresh all file states after sync
@@ -371,7 +414,6 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 bool FLoreSourceControlProvider::CanExecuteOperation(
     const FSourceControlOperationRef& InOperation) const
 {
-    //return IsAvailable();
     return true;
 }
 
@@ -401,6 +443,47 @@ TOptional<bool> FLoreSourceControlProvider::HasChangesToCheckIn() const
 
 void FLoreSourceControlProvider::Tick()
 {
+    if (bPendingStartupCheck)
+    {
+        bPendingStartupCheck = false;
+
+        FString StatusOutput = RunLoreCommand({ TEXT("status") });
+        bool bLocalOk = StatusOutput.Contains(TEXT("Repository"))
+                     && !StatusOutput.Contains(TEXT("Error"));
+
+        if (!bLocalOk)
+        {
+            bIsConnected = false;
+            StatusMessage = TEXT("Local repo not found. Please reconnect.");
+            ShowReconnectNotification();
+        }
+        else
+        {
+            FString ServerCheck = RunLoreCommand({
+                TEXT("repository"), TEXT("list"), ServerUrl,
+                TEXT("--identity"), Identity
+            });
+
+            bool bRepoExists = ServerCheck.Contains(RepositoryName)
+                            && !ServerCheck.Contains(TEXT("Error"));
+
+            if (bRepoExists)
+            {
+                bIsConnected = true;
+                StatusMessage = FString::Printf(
+                    TEXT("Connected to %s/%s"), *ServerUrl, *RepositoryName);
+            }
+            else
+            {
+                bIsConnected = false;
+                StatusMessage = FString::Printf(
+                    TEXT("Repository '%s' not found on server. Please reconnect."),
+                    *RepositoryName);
+                ShowReconnectNotification();
+            }
+        }
+    }
+
     // Refresh state every 30 seconds when connected
     if (bIsConnected)
     {
@@ -409,7 +492,6 @@ void FLoreSourceControlProvider::Tick()
         if (CurrentTime - LastRefreshTime > 30.0)
         {
             LastRefreshTime = CurrentTime;
-            // Refresh cached states
             TArray<FString> CachedFiles;
             StateCache.GetKeys(CachedFiles);
             if (CachedFiles.Num() > 0)
@@ -423,12 +505,15 @@ void FLoreSourceControlProvider::Tick()
 TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 {
     return SNew(SLoreSettings);
-        
 }
 
 FString FLoreSourceControlProvider::RunLoreCommand(
     const TArray<FString>& Args) const
 {
+    FString AbsProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+    UE_LOG(LogTemp, Warning, TEXT("LoreSourceControl: Using CWD: %s"), *AbsProjectDir);
+
+    // Build the lore command line
     FString ArgString;
     for (int32 i = 0; i < Args.Num(); i++)
     {
@@ -436,24 +521,57 @@ FString FLoreSourceControlProvider::RunLoreCommand(
         ArgString += TEXT("\"") + Args[i] + TEXT("\"");
     }
 
+    // FPlatformProcess::CreateProc's WorkingDirectory param is unreliable
+    // on Linux for this engine build, and nested quoting for `bash -c`
+    // breaks UE's own command-line tokenizer. Write a temp script instead
+    // — this avoids all quoting issues entirely.
+    FString ScriptPath = FPaths::Combine(FPlatformProcess::UserTempDir(), TEXT("lore_cmd.sh"));
+    FString ScriptContent = FString::Printf(
+        TEXT("#!/bin/bash\ncd \"%s\"\nlore %s\n"), *AbsProjectDir, *ArgString);
+
+    FFileHelper::SaveStringToFile(ScriptContent, *ScriptPath);
+
+    // Make it executable
+   
+
     void* ReadPipe  = nullptr;
     void* WritePipe = nullptr;
     FPlatformProcess::CreatePipe(ReadPipe, WritePipe);
 
     FProcHandle ProcHandle = FPlatformProcess::CreateProc(
-        TEXT("lore"), *ArgString,
+        TEXT("/bin/bash"), *ScriptPath,
         false, true, true,
         nullptr, 0,
-        *FPaths::ProjectDir(),  // ← add this, was nullptr before
+        nullptr,
         WritePipe, ReadPipe
     );
 
     FString Output;
     if (ProcHandle.IsValid())
     {
+        const double StartTime = FPlatformTime::Seconds();
+        const double TimeoutSeconds = 30.0;
+
         while (FPlatformProcess::IsProcRunning(ProcHandle))
         {
             Output += FPlatformProcess::ReadPipe(ReadPipe);
+
+            if (FPlatformTime::Seconds() - StartTime > TimeoutSeconds)
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("LoreSourceControl: Command timed out: %s"), *ArgString);
+
+                pid_t Pid = (pid_t)(intptr_t)ProcHandle.Get();
+                if (Pid != 0)
+                {
+                    kill(Pid, SIGKILL);
+                }
+                FPlatformProcess::TerminateProc(ProcHandle, true);
+
+                Output = TEXT("ERROR: timeout");
+                break;
+            }
+
             FPlatformProcess::Sleep(0.01f);
         }
         Output += FPlatformProcess::ReadPipe(ReadPipe);
@@ -465,56 +583,104 @@ FString FLoreSourceControlProvider::RunLoreCommand(
     }
 
     FPlatformProcess::ClosePipe(ReadPipe, WritePipe);
+    IFileManager::Get().Delete(*ScriptPath);
+
     return Output.TrimStartAndEnd();
 }
-void FLoreSourceControlProvider::UpdateStateCache(
-    const TArray<FString>& InFiles)
+void FLoreSourceControlProvider::UpdateStateCache(const TArray<FString>& InFiles)
 {
-    FString StatusOutput = RunLoreCommand({ TEXT("status") });
+    FString HomeDir = FPlatformMisc::GetEnvironmentVariable(TEXT("HOME"));
 
-    TArray<FString> Lines;
-    StatusOutput.ParseIntoArrayLines(Lines);
+    // --- Run lore lock query to get locked files ---
+    TSet<FString> LockedFiles;
+    FString LockOutput = RunLoreCommand({ TEXT("lock"), TEXT("query") });
+    TArray<FString> LockLines;
+    LockOutput.ParseIntoArrayLines(LockLines);
 
-    // Parse status lines like "M Content/maps/map_1.umap"
-    TMap<FString, TCHAR> StatusMap;
-    for (const FString& Line : Lines)
+    for (const FString& Line : LockLines)
     {
-        if (Line.Len() < 3) continue;
-        TCHAR StatusChar = Line[0];
-        if (StatusChar != 'M' && StatusChar != 'A' && StatusChar != 'D')
-            continue;
-        FString RelPath = Line.Mid(2).TrimStartAndEnd();
-        FString AbsPath = FPaths::ConvertRelativePathToFull(
-            FPaths::ProjectDir() / RelPath);
-        StatusMap.Add(AbsPath, StatusChar);
+        // Lines look like:
+        // Projects/UnrealProjects/MyProject/Content/maps/map_2.umap by <unknown> on branch xxx
+        if (Line.StartsWith(TEXT("Projects/")) || Line.StartsWith(TEXT("/")))
+        {
+            // Grab just the path part before " by "
+            FString PathPart;
+            if (Line.Split(TEXT(" by "), &PathPart, nullptr))
+            {
+                PathPart = PathPart.TrimStartAndEnd();
+            }
+            else
+            {
+                PathPart = Line.TrimStartAndEnd();
+            }
+
+            // Make absolute — Lore gives path relative to HOME
+            FString AbsPath = FPaths::ConvertRelativePathToFull(HomeDir / PathPart);
+            FPaths::NormalizeFilename(AbsPath);
+            LockedFiles.Add(AbsPath);
+        }
     }
 
-    // Update cache for each requested file
+    // --- Run lore status to get dirty/staged files ---
+    TSet<FString> DirtyFiles;
+    FString StatusOutput = RunLoreCommand({ TEXT("status") });
+    TArray<FString> StatusLines;
+    StatusOutput.ParseIntoArrayLines(StatusLines);
+
+    bool bInStagedSection = false;
+    for (const FString& Line : StatusLines)
+    {
+        if (Line.Contains(TEXT("staged for commit")))
+        {
+            bInStagedSection = true;
+            continue;
+        }
+        if (Line.IsEmpty()) { bInStagedSection = false; continue; }
+
+        if (bInStagedSection)
+        {
+            FString TrimmedLine = Line.TrimStartAndEnd();
+
+            // Strip the leading status char + space ("M ", "A ", "D " etc)
+            if (TrimmedLine.Len() > 2 && TrimmedLine[1] == TEXT(' '))
+            {
+                TrimmedLine = TrimmedLine.Mid(2).TrimStartAndEnd();
+            }
+
+            // Path is relative to project root
+            FString AbsPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TrimmedLine);
+            FPaths::NormalizeFilename(AbsPath);
+            DirtyFiles.Add(AbsPath);
+        }
+    }
+
+    // --- Update StateCache for every requested file ---
     for (const FString& File : InFiles)
     {
+        FString NormFile = NormalizeLorePath(File);
         TSharedRef<FLoreSourceControlState> State =
-            MakeShared<FLoreSourceControlState>(File);
-        State->TimeStamp  = FDateTime::Now();
-        State->bIsUnknown = true;
+            MakeShared<FLoreSourceControlState>(NormFile);
 
-        const TCHAR* Found = StatusMap.Find(File);
-        if (Found)
+        if (LockedFiles.Contains(NormFile))
         {
+            State->bIsLocked   = true;
+            State->bIsModified = true;
             State->bIsUnknown  = false;
-            State->bIsModified = (*Found == 'M');
-            State->bIsAdded    = (*Found == 'A');
-            State->bIsDeleted  = (*Found == 'D');
+        }
+        else if (DirtyFiles.Contains(NormFile))
+        {
+            State->bIsModified = true;
+            State->bIsUnknown  = false;
         }
         else
         {
-            // File is tracked and clean
-            State->bIsUnknown  = false;
             State->bIsModified = false;
-            State->bIsAdded    = false;
-            State->bIsDeleted  = false;
+            State->bIsLocked   = false;
+            State->bIsUnknown  = false;
         }
 
-        StateCache.Add(File, State);
+        State->TimeStamp = FDateTime::Now();
+        StateCache.Add(NormFile, State);
     }
 
     OnSourceControlStateChanged.Broadcast();

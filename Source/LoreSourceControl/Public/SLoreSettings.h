@@ -16,26 +16,22 @@ public:
     void Construct(const FArguments& InArgs);
 
 private:
-    // -------------------------------------------------------
-    // Widget references — we keep these so we can
-    // read their values when Connect is clicked
-    // -------------------------------------------------------
     TSharedPtr<SEditableTextBox> ServerUrlBox;
     TSharedPtr<SEditableTextBox> RepositoryBox;
     TSharedPtr<SEditableTextBox> IdentityBox;
     TSharedPtr<STextBlock>       StatusText;
 
-    // -------------------------------------------------------
-    // Button callbacks
-    // -------------------------------------------------------
     FReply OnConnectClicked();
     FReply OnDisconnectClicked();
     void OnConnectSuccess();
-    void OnConnectFucked(const FString& Output, const FString& RepoUrl,
-                        FLoreSourceControlProvider* Provider);
 
-    // -------------------------------------------------------
-    // Helper — get our provider
-    // -------------------------------------------------------
+    void HandleRepoMissingOnServer(FLoreSourceControlProvider* Provider);
+    void HandleCloneConflict(FLoreSourceControlProvider* Provider, const FString& RepoUrl);
+    void PushLocalFilesToRepo(FLoreSourceControlProvider* Provider);
+
+    bool LocalRepoExists(FLoreSourceControlProvider* Provider) const;
+    bool LocalFolderHasProjectFiles() const;
+    bool IsServerRepoEmpty(FLoreSourceControlProvider* Provider, const FString& RepoUrl) const;
+
     FLoreSourceControlProvider* GetProvider() const;
 };

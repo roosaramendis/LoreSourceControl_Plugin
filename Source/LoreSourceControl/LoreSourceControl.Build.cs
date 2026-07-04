@@ -21,6 +21,7 @@ public class LoreSourceControl : ModuleRules
             "UnrealEd",
             "ToolMenus",
             "InputCore",
+            "SourceControlWindows",
         });
     }
 }

@@ -20,7 +20,7 @@ public:
         { return FilePath; }
 
     virtual bool IsCheckedOut() const override
-        { return bIsModified; }
+        { return bIsModified || bIsLocked; }
 
     virtual bool IsCheckedOutOther(FString* Who = nullptr) const override
         { return false; }
