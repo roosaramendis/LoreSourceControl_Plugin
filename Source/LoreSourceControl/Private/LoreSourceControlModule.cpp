@@ -1,33 +1,28 @@
 #include "LoreSourceControlModule.h"
-#include "LoreSourceControlProvider.h"
+
 #include "Features/IModularFeatures.h"
 #include "Modules/ModuleManager.h"
 
-#define LOCTEXT_NAMESPACE "FLoreSourceControlModule"
-
 void FLoreSourceControlModule::StartupModule()
 {
-    IModularFeatures::Get().RegisterModularFeature(
-        "SourceControl",
-        &LoreProvider
-    );
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Provider registered!"));
+	IModularFeatures::Get().RegisterModularFeature("SourceControl", &LoreProvider);
+	UE_LOG(LogLoreSC, Log, TEXT("Lore revision control provider registered."));
 }
 
 void FLoreSourceControlModule::ShutdownModule()
 {
-    LoreProvider.Close();
-    IModularFeatures::Get().UnregisterModularFeature(
-        "SourceControl",
-        &LoreProvider
-    );
+	LoreProvider.Close();
+	IModularFeatures::Get().UnregisterModularFeature("SourceControl", &LoreProvider);
 }
 
-FLoreSourceControlProvider& FLoreSourceControlModule::GetProvider()
+FLoreSourceControlModule& FLoreSourceControlModule::Get()
 {
-    return LoreProvider;
+	return FModuleManager::GetModuleChecked<FLoreSourceControlModule>("LoreSourceControl");
 }
 
-#undef LOCTEXT_NAMESPACE
+bool FLoreSourceControlModule::IsLoaded()
+{
+	return FModuleManager::Get().IsModuleLoaded("LoreSourceControl");
+}
 
 IMPLEMENT_MODULE(FLoreSourceControlModule, LoreSourceControl)

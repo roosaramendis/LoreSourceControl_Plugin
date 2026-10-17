@@ -1,100 +1,69 @@
 #pragma once
 
+// What the editor shows for one file (icon, tooltip, which menu entries are
+// enabled). Only touched on the game thread.
+
 #include "CoreMinimal.h"
 #include "ISourceControlState.h"
-#include "Styling/SlateBrush.h"
+#include "LoreUtils.h"
 
 class FLoreSourceControlState : public ISourceControlState
 {
 public:
-    explicit FLoreSourceControlState(const FString& InFilePath)
-        : FilePath(InFilePath)
-        , bIsModified(false)
-        , bIsAdded(false)
-        , bIsDeleted(false)
-        , bIsLocked(false)
-        , bIsUnknown(true)
-    {}
+	explicit FLoreSourceControlState(const FString& InFilename)
+		: Filename(InFilename)
+	{
+	}
 
-    virtual const FString& GetFilename() const override
-        { return FilePath; }
+	// Copies a worker result into this state.
+	void ApplyStatus(const FLoreFileStatus& Status);
 
-    virtual bool IsCheckedOut() const override
-        { return bIsModified || bIsLocked; }
+	// ---- ISourceControlState ----
+	virtual const FString& GetFilename() const override { return Filename; }
+	virtual const FDateTime& GetTimeStamp() const override { return TimeStamp; }
 
-    virtual bool IsCheckedOutOther(FString* Who = nullptr) const override
-        { return false; }
+	virtual bool IsCheckedOut() const override;
+	virtual bool IsCheckedOutOther(FString* Who = nullptr) const override;
+	virtual bool IsCheckedOutInOtherBranch(const FString& CurrentBranch = FString()) const override { return false; }
+	virtual bool IsModifiedInOtherBranch(const FString& CurrentBranch = FString()) const override { return false; }
+	virtual bool IsCheckedOutOrModifiedInOtherBranch(const FString& CurrentBranch = FString()) const override { return false; }
+	virtual TArray<FString> GetCheckedOutBranches() const override { return {}; }
+	virtual FString GetOtherUserBranchCheckedOuts() const override { return FString(); }
+	virtual bool GetOtherBranchHeadModification(FString& HeadBranchOut, FString& ActionOut, int32& HeadChangeListOut) const override { return false; }
 
-    virtual bool IsCheckedOutInOtherBranch(
-        const FString& CurrentBranch = TEXT("")) const override
-        { return false; }
+	virtual bool IsCurrent() const override { return bIsCurrent; }
+	virtual bool IsSourceControlled() const override;
+	virtual bool IsAdded() const override { return WorkingState == ELoreWorkingState::Added; }
+	virtual bool IsDeleted() const override { return WorkingState == ELoreWorkingState::Deleted; }
+	virtual bool IsIgnored() const override { return false; }
+	virtual bool IsModified() const override;
+	virtual bool IsUnknown() const override { return WorkingState == ELoreWorkingState::Unknown; }
+	virtual bool IsConflicted() const override { return false; }
 
-    virtual bool IsModifiedInOtherBranch(
-        const FString& CurrentBranch = TEXT("")) const override
-        { return false; }
+	virtual bool CanCheckIn() const override;
+	virtual bool CanCheckout() const override;
+	virtual bool CanEdit() const override;
+	virtual bool CanDelete() const override;
+	virtual bool CanAdd() const override { return WorkingState == ELoreWorkingState::NotTracked; }
+	virtual bool CanRevert() const override;
 
-    virtual bool IsCheckedOutOrModifiedInOtherBranch(
-        const FString& CurrentBranch = TEXT("")) const override
-        { return false; }
+	virtual FText GetDisplayName() const override;
+	virtual FText GetDisplayTooltip() const override;
+	virtual FSlateIcon GetIcon() const override;
 
-    virtual TArray<FString> GetCheckedOutBranches() const override
-        { return {}; }
+	// History is Phase 2.
+	virtual int32 GetHistorySize() const override { return 0; }
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetHistoryItem(int32 HistoryIndex) const override { return nullptr; }
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(int32 RevisionNumber) const override { return nullptr; }
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(const FString& InRevision) const override { return nullptr; }
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetCurrentRevision() const override { return nullptr; }
 
-    virtual FString GetOtherUserBranchCheckedOuts() const override
-        { return TEXT(""); }
-
-    virtual bool GetOtherBranchHeadModification(
-        FString& HeadBranchOut,
-        FString& ActionOut,
-        int32& HeadChangeListOut) const override
-        { return false; }
-
-    virtual bool IsCurrent() const override      { return true; }
-    virtual bool IsSourceControlled() const override { return !bIsUnknown; }
-    virtual bool IsAdded() const override        { return bIsAdded; }
-    virtual bool IsDeleted() const override      { return bIsDeleted; }
-    virtual bool IsIgnored() const override      { return false; }
-    virtual bool IsModified() const override     { return bIsModified; }
-    virtual bool IsUnknown() const override      { return bIsUnknown; }
-    virtual bool IsConflicted() const override   { return false; }
-
-    virtual bool CanCheckIn() const override
-        { return bIsModified || bIsAdded || bIsDeleted; }
-    virtual bool CanCheckout() const override
-        { return !bIsModified && !bIsUnknown; }
-    virtual bool CanEdit() const override        { return true; }
-    virtual bool CanDelete() const override      { return IsSourceControlled(); }
-    virtual bool CanAdd() const override         { return bIsUnknown; }
-    virtual bool CanRevert() const override      { return bIsModified; }
-
-    virtual FText GetDisplayName() const override;
-    virtual FText GetDisplayTooltip() const override;
-
-    // UE 5.8 uses FSlateIcon
-    virtual FSlateIcon GetIcon() const override;
-
-    virtual const FDateTime& GetTimeStamp() const override
-        { return TimeStamp; }
-
-    // History
-    virtual int32 GetHistorySize() const override { return 0; }
-    virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe>
-        GetHistoryItem(int32 HistoryIndex) const override { return nullptr; }
-    virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe>
-        FindHistoryRevision(int32 RevisionNumber) const override { return nullptr; }
-    virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe>
-        FindHistoryRevision(const FString& InRevision) const override { return nullptr; }
-    virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe>
-        GetCurrentRevision() const override { return nullptr; }
-
-    // -------------------------------------------------------
-    // Lore-specific data
-    // -------------------------------------------------------
-    FString   FilePath;
-    bool      bIsModified;
-    bool      bIsAdded;
-    bool      bIsDeleted;
-    bool      bIsLocked;
-    bool      bIsUnknown;
-    FDateTime TimeStamp;
+	// ---- Lore data ----
+	FString Filename;
+	ELoreWorkingState WorkingState = ELoreWorkingState::Unknown;
+	bool bStaged = false;
+	ELoreLockState LockState = ELoreLockState::None;
+	FString LockOwner;
+	bool bIsCurrent = true;
+	FDateTime TimeStamp;
 };

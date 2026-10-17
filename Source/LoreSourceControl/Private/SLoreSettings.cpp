@@ -1,382 +1,411 @@
 #include "SLoreSettings.h"
-#include "LoreSourceControlProvider.h"
+
 #include "LoreSourceControlModule.h"
-#include "Widgets/Input/SEditableTextBox.h"
-#include "Widgets/Input/SButton.h"
-#include "Widgets/Text/STextBlock.h"
-#include "Widgets/Layout/SBox.h"
-#include "Widgets/Layout/SSeparator.h"
-#include "Misc/MessageDialog.h"
-#include "Misc/ConfigCacheIni.h"
-#include "HAL/PlatformFileManager.h"
+#include "LoreSourceControlProvider.h"
+
+#include "Async/Async.h"
 #include "Misc/FileHelper.h"
+#include "Misc/MessageDialog.h"
+#include "Misc/Paths.h"
+#include "Styling/AppStyle.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/Text/STextBlock.h"
 
 #define LOCTEXT_NAMESPACE "SLoreSettings"
 
-void SLoreSettings::OnConnectSuccess()
+namespace LoreSettingsLocal
 {
-    FLoreSourceControlProvider* Provider = GetProvider();
-    if (!Provider) return;
+	static FLoreSourceControlProvider& Provider()
+	{
+		return FLoreSourceControlModule::Get().GetProvider();
+	}
 
-    GConfig->SetString(TEXT("LoreSourceControl"), TEXT("ServerUrl"),
-        *Provider->ServerUrl, GEditorSettingsIni);
-    GConfig->SetString(TEXT("LoreSourceControl"), TEXT("RepositoryName"),
-        *Provider->RepositoryName, GEditorSettingsIni);
-    GConfig->SetString(TEXT("LoreSourceControl"), TEXT("Identity"),
-        *Provider->Identity, GEditorSettingsIni);
-    GConfig->Flush(false, GEditorSettingsIni);
+	static const FLinearColor Green(0.3f, 0.9f, 0.3f);
+	static const FLinearColor Yellow(1.0f, 0.8f, 0.2f);
+	static const FLinearColor Red(1.0f, 0.35f, 0.3f);
 
-    Provider->SetConnected(true);
-
-    StatusText->SetText(FText::Format(
-        LOCTEXT("Connected", "Connected to {0}/{1}"),
-        FText::FromString(Provider->ServerUrl),
-        FText::FromString(Provider->RepositoryName)
-    ));
-    StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.2f, 0.8f, 0.2f)));
+	// Default ignore list for an Unreal project, written only if missing.
+	static void EnsureLoreIgnore(const FString& Root)
+	{
+		const FString Path = Root / TEXT(".loreignore");
+		if (FPaths::FileExists(Path))
+		{
+			return;
+		}
+		const FString Content =
+			TEXT("Binaries/\n")
+			TEXT("Intermediate/\n")
+			TEXT("Saved/\n")
+			TEXT("DerivedDataCache/\n")
+			TEXT(".vscode/\n")
+			TEXT(".idea/\n")
+			TEXT(".vs/\n")
+			TEXT("*.log\n")
+			TEXT("*.sln\n")
+			TEXT("*.code-workspace\n");
+		FFileHelper::SaveStringToFile(Content, *Path);
+	}
 }
 
 void SLoreSettings::Construct(const FArguments& InArgs)
 {
-    FString SavedServer, SavedRepo, SavedIdentity;
-    GConfig->GetString(TEXT("LoreSourceControl"), TEXT("ServerUrl"), SavedServer, GEditorSettingsIni);
-    GConfig->GetString(TEXT("LoreSourceControl"), TEXT("RepositoryName"), SavedRepo, GEditorSettingsIni);
-    GConfig->GetString(TEXT("LoreSourceControl"), TEXT("Identity"), SavedIdentity, GEditorSettingsIni);
+	using namespace LoreSettingsLocal;
 
-    ChildSlot
-    [
-        SNew(SVerticalBox)
+	ChildSlot
+	[
+		SNew(SVerticalBox)
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 8.f)
-        [
-            SNew(STextBlock)
-            .Text(LOCTEXT("Title", "Lore Source Control"))
-            .Font(FCoreStyle::GetDefaultFontStyle("Bold", 14))
-        ]
+		+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 4.0f)
+		[
+			SNew(STextBlock)
+			.Text(this, &SLoreSettings::GetRepoInfoText)
+			.AutoWrapText(true)
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 8.f)
-        [ SNew(SSeparator) ]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			MakeField(LOCTEXT("ServerLabel", "Server URL"),
+				LOCTEXT("ServerHint", "lore://192.168.1.10:41337"),
+				LOCTEXT("ServerTip", "Address of the Lore server. Once the project has a .lore folder, the remote stored in .lore/config.toml is used instead."),
+				&FLoreSettings::ServerUrl)
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 4.f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().VAlign(VAlign_Center).FillWidth(0.3f)
-            [ SNew(STextBlock).Text(LOCTEXT("ServerLabel", "Server URL")) ]
-            + SHorizontalBox::Slot().FillWidth(0.7f)
-            [
-                SAssignNew(ServerUrlBox, SEditableTextBox)
-                .HintText(LOCTEXT("ServerHint", "lore://127.0.0.1:41337"))
-                .Text(FText::FromString(SavedServer.IsEmpty()
-                    ? TEXT("lore://127.0.0.1:41337") : SavedServer))
-            ]
-        ]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			MakeField(LOCTEXT("RepoLabel", "Repository"),
+				LOCTEXT("RepoHint", "MY_PROJECT"),
+				LOCTEXT("RepoTip", "Repository name on the server. Only used by 'Set Up Repository'."),
+				&FLoreSettings::RepositoryName)
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 4.f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().VAlign(VAlign_Center).FillWidth(0.3f)
-            [ SNew(STextBlock).Text(LOCTEXT("RepoLabel", "Repository")) ]
-            + SHorizontalBox::Slot().FillWidth(0.7f)
-            [
-                SAssignNew(RepositoryBox, SEditableTextBox)
-                .HintText(LOCTEXT("RepoHint", "MyProject"))
-                .Text(FText::FromString(SavedRepo))
-            ]
-        ]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			MakeField(LOCTEXT("IdentityLabel", "Identity"),
+				LOCTEXT("IdentityHint", "you@studio.com"),
+				LOCTEXT("IdentityTip", "Your Lore identity (passed as --identity). Leave empty to use the one in .lore/config.toml."),
+				&FLoreSettings::Identity)
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 4.f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().VAlign(VAlign_Center).FillWidth(0.3f)
-            [ SNew(STextBlock).Text(LOCTEXT("IdentityLabel", "Identity")) ]
-            + SHorizontalBox::Slot().FillWidth(0.7f)
-            [
-                SAssignNew(IdentityBox, SEditableTextBox)
-                .HintText(LOCTEXT("IdentityHint", "you@studio.com"))
-                .Text(FText::FromString(SavedIdentity))
-            ]
-        ]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			MakeField(LOCTEXT("BinaryLabel", "Lore executable"),
+				FText::FromString(LoreUtils::DefaultLoreBinary()),
+				LOCTEXT("BinaryTip", "Full path to the lore program. Leave empty to auto-detect (~/.local/bin, /usr/local/bin, /usr/bin, PATH)."),
+				&FLoreSettings::LoreBinary)
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 8.f)
-        [ SNew(SSeparator) ]
+		+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 6.0f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 6.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("CheckBtn", "Check Connection"))
+				.ToolTipText(LOCTEXT("CheckTip", "Checks the local .lore repository and whether the server has it. Changes nothing."))
+				.IsEnabled(this, &SLoreSettings::IsIdle)
+				.OnClicked(this, &SLoreSettings::OnCheckConnection)
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SetupBtn", "Set Up Repository"))
+				.ToolTipText(LOCTEXT("SetupTip", "Creates the repository on the server from this project and uploads it (asks first). Only works if this project has no .lore folder yet."))
+				.IsEnabled(this, &SLoreSettings::IsIdle)
+				.OnClicked(this, &SLoreSettings::OnSetUpRepository)
+			]
+		]
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 4.f)
-        [
-            SAssignNew(StatusText, STextBlock)
-            .Text(LOCTEXT("StatusIdle", "Not connected"))
-            .ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
-        ]
+		+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 4.0f)
+		[
+			SNew(STextBlock)
+			.Text_Lambda([this]() { return FText::FromString(StatusMessage); })
+			.ColorAndOpacity_Lambda([this]() { return FSlateColor(StatusColor); })
+			.AutoWrapText(true)
+		]
+	];
 
-        + SVerticalBox::Slot().AutoHeight().Padding(0.f, 8.f, 0.f, 0.f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().Padding(0.f, 0.f, 8.f, 0.f)
-            [
-                SNew(SButton)
-                .Text(LOCTEXT("ConnectBtn", "Connect"))
-                .OnClicked(this, &SLoreSettings::OnConnectClicked)
-            ]
-            + SHorizontalBox::Slot().AutoWidth()
-            [
-                SNew(SButton)
-                .Text(LOCTEXT("DisconnectBtn", "Disconnect"))
-                .OnClicked(this, &SLoreSettings::OnDisconnectClicked)
-            ]
-        ]
-    ];
+	if (Provider().IsRepoFound())
+	{
+		StartProbe(false);
+	}
+	else
+	{
+		SetStatus(TEXT("This project has no Lore repository yet. Fill in Server URL, Repository and Identity, then click 'Set Up Repository'."), Yellow);
+	}
 }
 
-bool SLoreSettings::LocalFolderHasProjectFiles() const
+TSharedRef<SWidget> SLoreSettings::MakeField(const FText& Label, const FText& Hint, const FText& Tooltip, FString FLoreSettings::* Field)
 {
-    TArray<FString> FoundFiles;
-    IFileManager::Get().FindFilesRecursive(
-        FoundFiles, *FPaths::ProjectContentDir(), TEXT("*.*"), true, false);
-    return FoundFiles.Num() > 0;
+	using namespace LoreSettingsLocal;
+
+	return SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().FillWidth(0.3f).VAlign(VAlign_Center).Padding(2.0f)
+		[
+			SNew(STextBlock).Text(Label).ToolTipText(Tooltip)
+		]
+		+ SHorizontalBox::Slot().FillWidth(0.7f).Padding(2.0f)
+		[
+			SNew(SEditableTextBox)
+			.HintText(Hint)
+			.ToolTipText(Tooltip)
+			.IsEnabled(this, &SLoreSettings::IsIdle)
+			.Text_Lambda([Field]() { return FText::FromString(Provider().GetSettings().*Field); })
+			.OnTextChanged_Lambda([Field](const FText& NewText)
+			{
+				FLoreSettings Settings = Provider().GetSettings();
+				Settings.*Field = NewText.ToString();
+				Provider().SetSettings(Settings, false);
+			})
+			.OnTextCommitted_Lambda([Field](const FText& NewText, ETextCommit::Type)
+			{
+				FLoreSettings Settings = Provider().GetSettings();
+				Settings.*Field = NewText.ToString();
+				Provider().SetSettings(Settings, true);
+			})
+		];
 }
 
-bool SLoreSettings::LocalRepoExists(FLoreSourceControlProvider* Provider) const
+FText SLoreSettings::GetRepoInfoText() const
 {
-    FString StatusOutput = Provider->RunLoreCommand({ TEXT("status") });
-    return StatusOutput.Contains(TEXT("Repository"))
-        && !StatusOutput.Contains(TEXT("Error"));
+	using namespace LoreSettingsLocal;
+	const FLoreSourceControlProvider& P = Provider();
+	if (P.IsRepoFound())
+	{
+		return FText::Format(LOCTEXT("RepoFound", "Lore repository: {0}\nServer in use: {1}"),
+			FText::FromString(P.GetRepoRoot()), FText::FromString(P.MakeContext().ServerUrl));
+	}
+	return FText::Format(LOCTEXT("RepoMissing", "No .lore folder found in {0}"), FText::FromString(P.GetRepoRoot()));
 }
 
-bool SLoreSettings::IsServerRepoEmpty(FLoreSourceControlProvider* Provider,
-    const FString& RepoUrl) const
+void SLoreSettings::SetStatus(const FString& Message, const FLinearColor& Color)
 {
-    FString HistoryOutput = Provider->RunLoreCommand({
-        TEXT("history"), RepoUrl, TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: History check RAW: %s"), *HistoryOutput);
-
-    bool bLooksEmpty = HistoryOutput.IsEmpty()
-        || HistoryOutput.Contains(TEXT("No revisions"))
-        || HistoryOutput.Contains(TEXT("0 revisions"));
-
-    return bLooksEmpty;
+	StatusMessage = Message;
+	StatusColor = Color;
 }
 
-void SLoreSettings::PushLocalFilesToRepo(FLoreSourceControlProvider* Provider)
+FReply SLoreSettings::OnCheckConnection()
 {
-    StatusText->SetText(LOCTEXT("Staging", "Staging existing project files..."));
-    FString StageOutput = Provider->RunLoreCommand({ TEXT("stage"), TEXT("--scan"), TEXT(".") });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Stage: %s"), *StageOutput);
-
-    StatusText->SetText(LOCTEXT("Committing", "Creating initial commit..."));
-    FString CommitOutput = Provider->RunLoreCommand({
-        TEXT("commit"), TEXT("Initial commit"), TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Commit: %s"), *CommitOutput);
-
-    StatusText->SetText(LOCTEXT("Pushing", "Pushing to server..."));
-    FString PushOutput = Provider->RunLoreCommand({ TEXT("push"), TEXT("--identity"), Provider->Identity });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Push: %s"), *PushOutput);
-
-    OnConnectSuccess();
+	StartProbe(false);
+	return FReply::Handled();
 }
 
-FReply SLoreSettings::OnConnectClicked()
+FReply SLoreSettings::OnSetUpRepository()
 {
-    FLoreSourceControlProvider* Provider = GetProvider();
-    if (!Provider) return FReply::Handled();
-
-    Provider->ServerUrl      = ServerUrlBox->GetText().ToString();
-    Provider->RepositoryName = RepositoryBox->GetText().ToString();
-    Provider->Identity       = IdentityBox->GetText().ToString();
-
-    StatusText->SetText(LOCTEXT("Connecting", "Connecting..."));
-    StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(1.f, 1.f, 0.f)));
-
-    // Step 1 — is the server reachable? MUST pass --identity or Lore
-    // treats us as anonymous and returns an empty repo list every time.
-    FString ServerCheck = Provider->RunLoreCommand({
-        TEXT("repository"), TEXT("list"), Provider->ServerUrl,
-        TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Server check: %s"), *ServerCheck);
-
-    bool bServerReachable = !ServerCheck.Contains(TEXT("Error"))
-                         && !ServerCheck.Contains(TEXT("transport error"))
-                         && !ServerCheck.Contains(TEXT("connect"));
-
-    if (!bServerReachable)
-    {
-        StatusText->SetText(FText::Format(
-            LOCTEXT("ServerUnreachable", "Cannot reach server: {0}"),
-            FText::FromString(Provider->ServerUrl)));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)));
-        return FReply::Handled();
-    }
-
-    FString RepoUrl = Provider->ServerUrl + TEXT("/") + Provider->RepositoryName;
-    bool bRepoOnServer = ServerCheck.Contains(Provider->RepositoryName);
-
-    // Step 2 — repo doesn't exist on server at all
-    if (!bRepoOnServer)
-    {
-        HandleRepoMissingOnServer(Provider);
-        return FReply::Handled();
-    }
-
-    // Step 3 — repo exists on server. Does local already have it?
-    if (LocalRepoExists(Provider))
-    {
-        OnConnectSuccess();
-        return FReply::Handled();
-    }
-
-    // Step 4 — no local repo yet. If the server repo is empty (fresh
-    // repo, never pushed to), it's safe to push local files into it
-    // regardless of what's in the local folder.
-    if (IsServerRepoEmpty(Provider, RepoUrl))
-    {
-        PushLocalFilesToRepo(Provider);
-        return FReply::Handled();
-    }
-
-    // Step 5 — server repo has real content. Local folder has unrelated files?
-    if (LocalFolderHasProjectFiles())
-    {
-        HandleCloneConflict(Provider, RepoUrl);
-        return FReply::Handled();
-    }
-
-    // Empty folder, server has real content — safe to clone
-    StatusText->SetText(LOCTEXT("Cloning", "Cloning from server..."));
-    FString CloneOutput = Provider->RunLoreCommand({
-        TEXT("clone"), RepoUrl, TEXT("."), TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Clone: %s"), *CloneOutput);
-
-    bool bCloneOk = !CloneOutput.Contains(TEXT("Error"))
-                 && !CloneOutput.Contains(TEXT("error"));
-
-    if (!bCloneOk)
-    {
-        StatusText->SetText(FText::Format(
-            LOCTEXT("CloneFailed", "Failed to clone: {0}"),
-            FText::FromString(CloneOutput)));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)));
-        return FReply::Handled();
-    }
-
-    OnConnectSuccess();
-    return FReply::Handled();
+	StartProbe(true);
+	return FReply::Handled();
 }
 
-void SLoreSettings::HandleRepoMissingOnServer(FLoreSourceControlProvider* Provider)
+void SLoreSettings::StartProbe(bool bForSetup)
 {
-    FText DialogMessage = FText::Format(
-        LOCTEXT("RepoMissingMsg",
-            "Repository '{0}' does not exist on the server. Would you like to create it? This is safe, it will only add Lore tracking to this folder and will not modify or delete any of your existing files."),
-        FText::FromString(Provider->RepositoryName));
+	using namespace LoreSettingsLocal;
 
-    EAppReturnType::Type Choice = FMessageDialog::Open(
-        EAppMsgType::YesNo, DialogMessage,
-        LOCTEXT("RepoMissingTitle", "Repository Not Found"));
+	FLoreSourceControlProvider& P = Provider();
+	P.RefreshRepoRoot();
+	const FLoreContext Ctx = P.MakeContext();
+	const bool bLocalRepo = P.IsRepoFound();
 
-    if (Choice != EAppReturnType::Yes)
-    {
-        StatusText->SetText(LOCTEXT("Cancelled", "Cancelled"));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)));
-        return;
-    }
+	if (Ctx.ServerUrl.IsEmpty())
+	{
+		SetStatus(TEXT("Enter the Server URL first (e.g. lore://192.168.1.10:41337)."), Red);
+		return;
+	}
+	if (Ctx.Identity.IsEmpty())
+	{
+		SetStatus(TEXT("Enter your Identity first (e.g. you@studio.com)."), Red);
+		return;
+	}
 
-    FString RepoUrl = Provider->ServerUrl + TEXT("/") + Provider->RepositoryName;
+	bBusy = true;
+	SetStatus(TEXT("Checking..."), FLinearColor::White);
 
-    StatusText->SetText(LOCTEXT("Creating", "Creating repository..."));
-    FString CreateOutput = Provider->RunLoreCommand({
-        TEXT("repository"), TEXT("create"), RepoUrl,
-        TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Create: %s"), *CreateOutput);
+	TWeakPtr<SLoreSettings> Weak = StaticCastSharedRef<SLoreSettings>(AsShared());
+	(void)Async(EAsyncExecution::ThreadPool, [Weak, Ctx, bLocalRepo, bForSetup]()
+	{
+		FLoreProbeResult Result;
+		Result.bLocalRepo = bLocalRepo;
+		if (bLocalRepo)
+		{
+			const FLoreResult Status = LoreUtils::Run(Ctx, { TEXT("status") }, 60.0);
+			if (Status.Ok())
+			{
+				FLoreRepoInfo Info;
+				LoreUtils::ParseStatus(Status.Output, Info);
+				Result.LocalRepoId = Info.RepoId;
+			}
+			else
+			{
+				Result.LocalError = Status.Describe();
+			}
+		}
+		const FLoreResult List = LoreUtils::Run(Ctx, { TEXT("repository"), TEXT("list"), Ctx.ServerUrl }, 30.0);
+		Result.bServerOk = List.Ok();
+		if (List.Ok())
+		{
+			LoreUtils::ParseRepositoryList(List.Output, Result.ServerRepos);
+		}
+		else
+		{
+			Result.ServerError = List.Describe();
+		}
 
-    bool bCreated = !CreateOutput.Contains(TEXT("Error"))
-                 && !CreateOutput.Contains(TEXT("error"));
-
-    if (!bCreated)
-    {
-        StatusText->SetText(FText::Format(
-            LOCTEXT("CreateFailed", "Failed to create: {0}"),
-            FText::FromString(CreateOutput)));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)));
-        return;
-    }
-
-    PushLocalFilesToRepo(Provider);
+		AsyncTask(ENamedThreads::GameThread, [Weak, Result, Ctx, bForSetup]()
+		{
+			if (TSharedPtr<SLoreSettings> Pinned = Weak.Pin())
+			{
+				Pinned->OnProbeDone(Result, Ctx, bForSetup);
+			}
+		});
+	});
 }
 
-void SLoreSettings::HandleCloneConflict(FLoreSourceControlProvider* Provider,
-    const FString& RepoUrl)
+void SLoreSettings::OnProbeDone(const FLoreProbeResult& Result, const FLoreContext& Ctx, bool bForSetup)
 {
-    FText DialogMessage = FText::Format(
-        LOCTEXT("CloneConflictMsg",
-            "The server already has a repository named '{0}' with existing content, and this folder already has project files not tracked by that repository. Choose Yes to delete the server repository and create a new one from THIS folder's files instead (use only if the server repo is unwanted). Choose No to cancel; nothing will be touched, and you can clone the server repo into a different empty folder instead."),
-        FText::FromString(Provider->RepositoryName));
+	using namespace LoreSettingsLocal;
+	bBusy = false;
 
-    EAppReturnType::Type Choice = FMessageDialog::Open(
-        EAppMsgType::YesNo, DialogMessage,
-        LOCTEXT("CloneConflictTitle", "Repository Conflict"));
+	if (!Result.bServerOk)
+	{
+		SetStatus(FString::Printf(TEXT("Cannot reach the server %s.\n%s"), *Ctx.ServerUrl, *Result.ServerError), Red);
+		return;
+	}
 
-    if (Choice != EAppReturnType::Yes)
-    {
-        StatusText->SetText(LOCTEXT("Cancelled",
-            "Cancelled. Clone into a new empty folder to merge manually"));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)));
-        return;
-    }
+	TArray<FString> Names;
+	for (const TPair<FString, FString>& Repo : Result.ServerRepos)
+	{
+		Names.Add(Repo.Key);
+	}
+	const FString NameList = Names.Num() > 0 ? FString::Join(Names, TEXT(", ")) : FString(TEXT("(none)"));
 
-    EAppReturnType::Type Confirm = FMessageDialog::Open(
-        EAppMsgType::YesNo,
-        LOCTEXT("ConfirmDeleteMsg",
-            "This will permanently delete the existing repository and its full history on the server. This cannot be undone. Are you absolutely sure?"),
-        LOCTEXT("ConfirmDeleteTitle", "Confirm Server Repository Deletion"));
+	// ---- this project already has a .lore folder ----
+	if (Result.bLocalRepo)
+	{
+		if (!Result.LocalError.IsEmpty() || Result.LocalRepoId.IsEmpty())
+		{
+			SetStatus(FString::Printf(TEXT("The .lore folder in %s looks broken: lore status failed.\n%s"), *Ctx.RepoRoot, *Result.LocalError), Red);
+			return;
+		}
+		bool bOnServer = false;
+		FString ServerName;
+		for (const TPair<FString, FString>& Repo : Result.ServerRepos)
+		{
+			if (Repo.Value.Equals(Result.LocalRepoId, ESearchCase::IgnoreCase))
+			{
+				bOnServer = true;
+				ServerName = Repo.Key;
+			}
+		}
+		if (bOnServer)
+		{
+			SetStatus(FString::Printf(TEXT("OK: this project is repository '%s' on %s.%s Click 'Accept Settings'."),
+				*ServerName, *Ctx.ServerUrl, bForSetup ? TEXT(" It is already set up.") : TEXT("")), Green);
+		}
+		else if (Result.ServerRepos.Num() == 0)
+		{
+			SetStatus(FString::Printf(TEXT("The server answered but listed no repositories for identity '%s'. If the repository exists, this identity may not have access."),
+				*Ctx.Identity), Yellow);
+		}
+		else
+		{
+			SetStatus(FString::Printf(TEXT("This project's .lore repository (id %s) is NOT on %s.\nRepositories on that server: %s\n"
+				"Check the server address in .lore/config.toml (remote_url), or move the .lore folder away and use 'Set Up Repository' to start fresh."),
+				*Result.LocalRepoId, *Ctx.ServerUrl, *NameList), Red);
+		}
+		return;
+	}
 
-    if (Confirm != EAppReturnType::Yes)
-    {
-        StatusText->SetText(LOCTEXT("Cancelled", "Cancelled"));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)));
-        return;
-    }
+	// ---- no .lore folder yet ----
+	if (Ctx.RepositoryName.IsEmpty())
+	{
+		SetStatus(TEXT("Enter a Repository name first."), Red);
+		return;
+	}
+	if (Names.Contains(Ctx.RepositoryName))
+	{
+		SetStatus(FString::Printf(TEXT("The server already has a repository named '%s'. To work on it, clone it into an EMPTY folder, then open the .uproject from there:\n"
+			"lore clone %s/%s ~/Projects/%s"),
+			*Ctx.RepositoryName, *Ctx.ServerUrl, *Ctx.RepositoryName, *Ctx.RepositoryName), Yellow);
+		return;
+	}
+	if (!bForSetup)
+	{
+		SetStatus(FString::Printf(TEXT("Server OK. '%s' does not exist there yet. Click 'Set Up Repository' to create it and upload this project."),
+			*Ctx.RepositoryName), Yellow);
+		return;
+	}
 
-    StatusText->SetText(LOCTEXT("Deleting", "Deleting old server repository..."));
-    FString DeleteOutput = Provider->RunLoreCommand({
-        TEXT("repository"), TEXT("delete"), RepoUrl,
-        TEXT("--identity"), Provider->Identity
-    });
-    UE_LOG(LogTemp, Log, TEXT("LoreSourceControl: Delete: %s"), *DeleteOutput);
-
-    bool bDeleted = !DeleteOutput.Contains(TEXT("Error"))
-                 && !DeleteOutput.Contains(TEXT("error"));
-
-    if (!bDeleted)
-    {
-        StatusText->SetText(FText::Format(
-            LOCTEXT("DeleteFailed", "Failed to delete old repository: {0}"),
-            FText::FromString(DeleteOutput)));
-        StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)));
-        return;
-    }
-
-    HandleRepoMissingOnServer(Provider);
+	const FText Question = FText::Format(LOCTEXT("ConfirmCreate",
+		"Create repository '{0}' on {1} and upload this project?\n\nFolder: {2}\n\n"
+		"A .loreignore file is written first (if missing) so Binaries, Intermediate, Saved and DerivedDataCache are not uploaded."),
+		FText::FromString(Ctx.RepositoryName), FText::FromString(Ctx.ServerUrl), FText::FromString(Ctx.RepoRoot));
+	if (FMessageDialog::Open(EAppMsgType::YesNo, Question, LOCTEXT("ConfirmCreateTitle", "Set Up Lore Repository")) != EAppReturnType::Yes)
+	{
+		SetStatus(TEXT("Cancelled."), FLinearColor::White);
+		return;
+	}
+	StartCreate(Ctx);
 }
 
-FReply SLoreSettings::OnDisconnectClicked()
+void SLoreSettings::StartCreate(const FLoreContext& Ctx)
 {
-    FLoreSourceControlProvider* Provider = GetProvider();
-    if (Provider) Provider->Close();
+	using namespace LoreSettingsLocal;
 
-    StatusText->SetText(LOCTEXT("Disconnected", "Disconnected"));
-    StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)));
+	EnsureLoreIgnore(Ctx.RepoRoot);
+	bBusy = true;
+	SetStatus(TEXT("Creating the repository and uploading the project. This can take a while for big projects..."), FLinearColor::White);
 
-    return FReply::Handled();
+	TWeakPtr<SLoreSettings> Weak = StaticCastSharedRef<SLoreSettings>(AsShared());
+	(void)Async(EAsyncExecution::ThreadPool, [Weak, Ctx]()
+	{
+		bool bOk = true;
+		FString Message;
+		auto Step = [&Ctx, &bOk, &Message](const TArray<FString>& Args, double Timeout, const TCHAR* What)
+		{
+			if (!bOk)
+			{
+				return;
+			}
+			const FLoreResult Result = LoreUtils::Run(Ctx, Args, Timeout);
+			if (!Result.Ok())
+			{
+				bOk = false;
+				Message = FString::Printf(TEXT("%s failed:\n%s"), What, *Result.Describe());
+			}
+		};
+
+		Step({ TEXT("repository"), TEXT("create"), Ctx.ServerUrl + TEXT("/") + Ctx.RepositoryName }, 120.0, TEXT("Creating the repository"));
+		Step({ TEXT("stage"), TEXT("--scan"), TEXT(".") }, 3600.0, TEXT("Adding the project files"));
+		Step({ TEXT("commit"), TEXT("Initial commit") }, 3600.0, TEXT("The initial commit"));
+		Step({ TEXT("push") }, 3600.0, TEXT("Uploading to the server"));
+
+		AsyncTask(ENamedThreads::GameThread, [Weak, bOk, Message]()
+		{
+			if (TSharedPtr<SLoreSettings> Pinned = Weak.Pin())
+			{
+				Pinned->OnCreateDone(bOk, Message);
+			}
+		});
+	});
 }
 
-FLoreSourceControlProvider* SLoreSettings::GetProvider() const
+void SLoreSettings::OnCreateDone(bool bOk, const FString& Message)
 {
-    FLoreSourceControlModule* Module = FModuleManager::GetModulePtr
-        <FLoreSourceControlModule>("LoreSourceControl");
-    return Module ? &Module->GetProvider() : nullptr;
+	using namespace LoreSettingsLocal;
+	bBusy = false;
+
+	FLoreSourceControlProvider& P = Provider();
+	P.RefreshRepoRoot();
+	if (bOk)
+	{
+		SetStatus(TEXT("Done: repository created and project uploaded. Click 'Accept Settings'."), Green);
+		P.StartConnectCheck();
+	}
+	else
+	{
+		SetStatus(Message + (P.IsRepoFound() ? TEXT("\nThe local .lore folder was created; click 'Check Connection' to see what is on the server.") : TEXT("")), Red);
+	}
 }
 
 #undef LOCTEXT_NAMESPACE

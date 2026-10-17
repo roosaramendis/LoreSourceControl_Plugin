@@ -1,37 +1,50 @@
 #pragma once
 
+// The panel shown in "Revision Control > Change Revision Control Provider"
+// when Lore is selected.
+
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
-#include "Misc/MessageDialog.h"
+#include "LoreUtils.h"
+#include "LoreSourceControlProvider.h" // FLoreSettings
 
-class FLoreSourceControlProvider;
+// What the background check found (filled on a worker thread).
+struct FLoreProbeResult
+{
+	bool bLocalRepo = false;
+	FString LocalRepoId;
+	FString LocalError;
+	bool bServerOk = false;
+	FString ServerError;
+	TArray<TPair<FString, FString>> ServerRepos; // name -> id
+};
 
 class SLoreSettings : public SCompoundWidget
 {
 public:
-    SLATE_BEGIN_ARGS(SLoreSettings) {}
-    SLATE_END_ARGS()
+	SLATE_BEGIN_ARGS(SLoreSettings) {}
+	SLATE_END_ARGS()
 
-    void Construct(const FArguments& InArgs);
+	void Construct(const FArguments& InArgs);
 
 private:
-    TSharedPtr<SEditableTextBox> ServerUrlBox;
-    TSharedPtr<SEditableTextBox> RepositoryBox;
-    TSharedPtr<SEditableTextBox> IdentityBox;
-    TSharedPtr<STextBlock>       StatusText;
+	TSharedRef<SWidget> MakeField(const FText& Label, const FText& Hint, const FText& Tooltip, FString FLoreSettings::* Field);
 
-    FReply OnConnectClicked();
-    FReply OnDisconnectClicked();
-    void OnConnectSuccess();
+	FText GetRepoInfoText() const;
+	bool IsIdle() const { return !bBusy; }
 
-    void HandleRepoMissingOnServer(FLoreSourceControlProvider* Provider);
-    void HandleCloneConflict(FLoreSourceControlProvider* Provider, const FString& RepoUrl);
-    void PushLocalFilesToRepo(FLoreSourceControlProvider* Provider);
+	FReply OnCheckConnection();
+	FReply OnSetUpRepository();
 
-    bool LocalRepoExists(FLoreSourceControlProvider* Provider) const;
-    bool LocalFolderHasProjectFiles() const;
-    bool IsServerRepoEmpty(FLoreSourceControlProvider* Provider, const FString& RepoUrl) const;
+	void StartProbe(bool bForSetup);
+	void OnProbeDone(const FLoreProbeResult& Result, const FLoreContext& Ctx, bool bForSetup);
+	void StartCreate(const FLoreContext& Ctx);
+	void OnCreateDone(bool bOk, const FString& Message);
 
-    FLoreSourceControlProvider* GetProvider() const;
+	void SetStatus(const FString& Message, const FLinearColor& Color);
+
+	bool bBusy = false;
+	FString StatusMessage;
+	FLinearColor StatusColor = FLinearColor::White;
 };
