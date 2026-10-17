@@ -69,10 +69,10 @@ public:
 	virtual bool UsesChangelists() const override             { return false; }
 	virtual bool UsesUncontrolledChangelists() const override { return false; }
 	virtual bool UsesCheckout() const override                { return true;  }
-	virtual bool UsesFileRevisions() const override           { return false; }
+	virtual bool UsesFileRevisions() const override           { return true;  }
 	virtual bool UsesSnapshots() const override               { return false; }
 	virtual bool UsesSoftRevertOnDelete() const override      { return false; }
-	virtual bool AllowsDiffAgainstDepot() const override      { return false; }
+	virtual bool AllowsDiffAgainstDepot() const override      { return true;  }
 
 	virtual TOptional<bool> HasChangesToSync() const override;
 	virtual TOptional<bool> HasChangesToCheckIn() const override;

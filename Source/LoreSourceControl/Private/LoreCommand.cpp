@@ -453,6 +453,28 @@ namespace LoreWork
 			TMap<FString, FLoreFileStatus> Out;
 			RefreshFiles(C, RelFiles, Out, true);
 			AddStatuses(C, Out);
+
+			// History window / Diff: one `lore file history` per file.
+			if (C.bUpdateHistory)
+			{
+				for (const FString& Rel : RelFiles)
+				{
+					const FLoreFileStatus* Status = Out.Find(Rel);
+					if (Status && (Status->State == ELoreWorkingState::NotTracked || Status->State == ELoreWorkingState::Added))
+					{
+						continue; // never committed -> no history
+					}
+					const FLoreResult History = LoreUtils::Run(C.Ctx, { TEXT("file"), TEXT("history"), Rel, TEXT("100") }, ShortTimeout);
+					if (!History.Ok())
+					{
+						UE_LOG(LogLoreSC, Log, TEXT("No history for %s: %s"), *Rel, *History.Describe());
+						continue;
+					}
+					TArray<FLoreHistoryEntry> Entries;
+					LoreUtils::ParseFileHistory(History.Output, Entries);
+					C.Histories.Add(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Rel), MoveTemp(Entries));
+				}
+			}
 		}
 
 		// No files at all: repository-wide refresh (revision numbers + locks).

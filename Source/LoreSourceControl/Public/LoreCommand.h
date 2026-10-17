@@ -50,6 +50,7 @@ public:
 	FString CheckInMessage;
 	bool bSoftRevert = false;
 	bool bKeepCheckedOut = false;          // "Keep files checked out" in the Submit dialog
+	bool bUpdateHistory = false;           // UpdateStatus: also read file history
 
 	// ---- results (written by the worker) ----
 	std::atomic<bool> bWorkDone{ false };
@@ -64,6 +65,7 @@ public:
 	bool bHasRepoInfo = false;
 	FLoreRepoInfo RepoInfo;
 	FString SuccessMessage;
+	TMap<FString, TArray<FLoreHistoryEntry>> Histories; // absolute path -> newest first
 
 private:
 	bool DoWork();

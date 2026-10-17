@@ -91,6 +91,50 @@ bool FLoreSourceControlState::CanRevert() const
 	return IsModified() || LockState == ELoreLockState::Mine;
 }
 
+TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlState::GetHistoryItem(int32 HistoryIndex) const
+{
+	if (History.IsValidIndex(HistoryIndex))
+	{
+		return History[HistoryIndex];
+	}
+	return nullptr;
+}
+
+TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlState::FindHistoryRevision(int32 RevisionNumber) const
+{
+	for (const TSharedRef<FLoreSourceControlRevision, ESPMode::ThreadSafe>& Revision : History)
+	{
+		if (Revision->GetRevisionNumber() == RevisionNumber)
+		{
+			return Revision;
+		}
+	}
+	return nullptr;
+}
+
+TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlState::FindHistoryRevision(const FString& InRevision) const
+{
+	for (const TSharedRef<FLoreSourceControlRevision, ESPMode::ThreadSafe>& Revision : History)
+	{
+		if (Revision->GetRevision() == InRevision || Revision->GetSignature() == InRevision)
+		{
+			return Revision;
+		}
+	}
+	return nullptr;
+}
+
+TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlState::GetCurrentRevision() const
+{
+	// History comes from the local branch, so the newest entry is the
+	// revision of this file that is on disk (ignoring local edits).
+	if (History.Num() > 0)
+	{
+		return History[0];
+	}
+	return nullptr;
+}
+
 FText FLoreSourceControlState::GetDisplayName() const
 {
 	if (LockState == ELoreLockState::Other)

@@ -6,6 +6,7 @@
 #include "CoreMinimal.h"
 #include "ISourceControlState.h"
 #include "LoreUtils.h"
+#include "LoreSourceControlRevision.h"
 
 class FLoreSourceControlState : public ISourceControlState
 {
@@ -51,12 +52,12 @@ public:
 	virtual FText GetDisplayTooltip() const override;
 	virtual FSlateIcon GetIcon() const override;
 
-	// History is Phase 2.
-	virtual int32 GetHistorySize() const override { return 0; }
-	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetHistoryItem(int32 HistoryIndex) const override { return nullptr; }
-	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(int32 RevisionNumber) const override { return nullptr; }
-	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(const FString& InRevision) const override { return nullptr; }
-	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetCurrentRevision() const override { return nullptr; }
+	// History (filled by an UpdateStatus with "update history", newest first)
+	virtual int32 GetHistorySize() const override { return History.Num(); }
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetHistoryItem(int32 HistoryIndex) const override;
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(int32 RevisionNumber) const override;
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FindHistoryRevision(const FString& InRevision) const override;
+	virtual TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> GetCurrentRevision() const override;
 
 	// ---- Lore data ----
 	FString Filename;
@@ -66,4 +67,5 @@ public:
 	FString LockOwner;
 	bool bIsCurrent = true;
 	FDateTime TimeStamp;
+	TArray<TSharedRef<FLoreSourceControlRevision, ESPMode::ThreadSafe>> History;
 };

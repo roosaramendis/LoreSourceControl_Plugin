@@ -93,6 +93,19 @@ struct FLoreStatusEntry
 	FString RelPath;
 };
 
+// One revision of one file, from `lore file history <path> N`.
+struct FLoreHistoryEntry
+{
+	int32 Number = 0;
+	FString Signature;   // the revision specifier lore accepts (--revision)
+	FString Address;     // content address of the file at this revision (file write --address)
+	TCHAR Action = TEXT('M'); // A, M, D ...
+	FString Message;
+	FString Creator;
+	FString Committer;
+	FDateTime Date;      // UTC
+};
+
 struct FLoreRepoInfo
 {
 	FString RepoId;
@@ -140,4 +153,6 @@ namespace LoreUtils
 	void ParseRepositoryList(const FString& Output, TArray<TPair<FString, FString>>& OutRepos); // name -> id
 	TOptional<int32> ParseFirstHistoryRevision(const FString& Output);
 	TOptional<int32> ParseCommittedRevision(const FString& Output);
+	void ParseFileHistory(const FString& Output, TArray<FLoreHistoryEntry>& OutEntries);
+	FDateTime ParseLoreDate(const FString& Text); // "Sat, 17 Oct 2026 09:35:42 +0000" -> UTC
 }

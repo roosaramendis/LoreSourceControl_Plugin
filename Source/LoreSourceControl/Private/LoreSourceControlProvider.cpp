@@ -369,6 +369,10 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 	{
 		bConnectInFlight = true;
 	}
+	else if (OpName == LoreOpNames::UpdateStatus)
+	{
+		Command->bUpdateHistory = StaticCastSharedRef<FUpdateStatus>(InOperation)->ShouldUpdateHistory();
+	}
 
 	if (InConcurrency == EConcurrency::Synchronous)
 	{
@@ -469,6 +473,16 @@ void FLoreSourceControlProvider::ApplyResults(FLoreCommand& Command)
 				State.LockState = ELoreLockState::None;
 				State.LockOwner.Reset();
 			}
+		}
+	}
+
+	for (const TPair<FString, TArray<FLoreHistoryEntry>>& Pair : Command.Histories)
+	{
+		TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> State = GetStateInternal(Pair.Key);
+		State->History.Reset();
+		for (const FLoreHistoryEntry& Entry : Pair.Value)
+		{
+			State->History.Add(MakeShared<FLoreSourceControlRevision, ESPMode::ThreadSafe>(Pair.Key, Entry, Command.Ctx));
 		}
 	}
 

@@ -480,6 +480,127 @@ TOptional<int32> LoreUtils::ParseCommittedRevision(const FString& Output)
 	return TOptional<int32>();
 }
 
+FDateTime LoreUtils::ParseLoreDate(const FString& Text)
+{
+	// "Sat, 17 Oct 2026 09:35:42 +0000"
+	TArray<FString> Parts;
+	Text.Replace(TEXT(","), TEXT(" ")).ParseIntoArrayWS(Parts);
+	if (Parts.Num() < 5)
+	{
+		return FDateTime();
+	}
+	int32 i = FChar::IsDigit(Parts[0][0]) ? 0 : 1; // skip the weekday
+	if (Parts.Num() < i + 4)
+	{
+		return FDateTime();
+	}
+	static const TCHAR* Months[] = { TEXT("Jan"), TEXT("Feb"), TEXT("Mar"), TEXT("Apr"), TEXT("May"), TEXT("Jun"),
+		TEXT("Jul"), TEXT("Aug"), TEXT("Sep"), TEXT("Oct"), TEXT("Nov"), TEXT("Dec") };
+	int32 Month = 0;
+	for (int32 m = 0; m < 12; ++m)
+	{
+		if (Parts[i + 1].StartsWith(Months[m], ESearchCase::IgnoreCase))
+		{
+			Month = m + 1;
+		}
+	}
+	const int32 Day = FCString::Atoi(*Parts[i]);
+	const int32 Year = FCString::Atoi(*Parts[i + 2]);
+	TArray<FString> Clock;
+	Parts[i + 3].ParseIntoArray(Clock, TEXT(":"));
+	if (Month == 0 || Clock.Num() < 2 || !FDateTime::Validate(Year, Month, Day, 0, 0, 0, 0))
+	{
+		return FDateTime();
+	}
+	FDateTime Result(Year, Month, Day, FCString::Atoi(*Clock[0]), FCString::Atoi(*Clock[1]), Clock.Num() > 2 ? FCString::Atoi(*Clock[2]) : 0);
+
+	// "+0530" style offset -> convert to UTC
+	if (Parts.Num() > i + 4)
+	{
+		const FString& Zone = Parts[i + 4];
+		if (Zone.Len() == 5 && (Zone[0] == TEXT('+') || Zone[0] == TEXT('-')))
+		{
+			const int32 Hours = FCString::Atoi(*Zone.Mid(1, 2));
+			const int32 Minutes = FCString::Atoi(*Zone.Mid(3, 2));
+			const FTimespan Offset(Hours, Minutes, 0);
+			Result = Zone[0] == TEXT('+') ? Result - Offset : Result + Offset;
+		}
+	}
+	return Result;
+}
+
+void LoreUtils::ParseFileHistory(const FString& Output, TArray<FLoreHistoryEntry>& OutEntries)
+{
+	// Blocks like this, separated by blank lines:
+	//   M                                  <- action (sometimes followed by the path)
+	//   Revision  : 5
+	//   Signature : b91769a9...
+	//   Address   : 286d5770...-01a14562...
+	//   Branch    : e726318b...
+	//   Date      : Sat, 17 Oct 2026 09:35:42 +0000
+	//       message line(s), indented
+	//   Creator   : test@studio.com
+	//   Committer : test@studio.com
+	TArray<FString> Lines;
+	Output.ParseIntoArrayLines(Lines, false);
+
+	FLoreHistoryEntry Current;
+	bool bHaveFields = false;
+	TArray<FString> MessageLines;
+
+	auto Finish = [&]()
+	{
+		if (bHaveFields && Current.Number > 0)
+		{
+			Current.Message = FString::Join(MessageLines, TEXT("\n"));
+			OutEntries.Add(Current);
+		}
+		Current = FLoreHistoryEntry();
+		MessageLines.Reset();
+		bHaveFields = false;
+	};
+
+	for (const FString& Raw : Lines)
+	{
+		const FString Line = Raw.TrimStartAndEnd();
+		if (Line.IsEmpty())
+		{
+			Finish();
+			continue;
+		}
+		if (Raw[0] == TEXT(' ') || Raw[0] == TEXT('\t'))
+		{
+			MessageLines.Add(Line); // indented = commit message
+			continue;
+		}
+
+		FString Key, Value;
+		if (Line.Split(TEXT(":"), &Key, &Value))
+		{
+			Key.TrimStartAndEndInline();
+			Value.TrimStartAndEndInline();
+			if (Key == TEXT("Revision"))       { Current.Number = FCString::Atoi(*Value); bHaveFields = true; continue; }
+			if (Key == TEXT("Signature"))      { Current.Signature = Value; continue; }
+			if (Key == TEXT("Address"))        { Current.Address = Value; continue; }
+			if (Key == TEXT("Date"))           { Current.Date = ParseLoreDate(Value); continue; }
+			if (Key == TEXT("Creator"))        { Current.Creator = Value; continue; }
+			if (Key == TEXT("Committer"))      { Current.Committer = Value; continue; }
+			if (Key == TEXT("Branch"))         { continue; }
+		}
+
+		// Action header ("M", "A Content/x.umap", ...) starts a new block.
+		if (Line.Len() == 1 || Line[1] == TEXT(' '))
+		{
+			if (bHaveFields)
+			{
+				Finish(); // no blank line between blocks
+			}
+			Current.Action = Line[0];
+		}
+	}
+	Finish();
+}
+
 // ---------------------------------------------------------------------------
 // FLoreLockStore
 // ---------------------------------------------------------------------------
