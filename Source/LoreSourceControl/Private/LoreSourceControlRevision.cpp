@@ -10,6 +10,7 @@ FLoreSourceControlRevision::FLoreSourceControlRevision(const FString& InFilename
 	, RevisionText(FString::FromInt(InEntry.Number))
 	, UserName(InEntry.Creator.IsEmpty() ? InEntry.Committer : InEntry.Creator)
 {
+	Ctx.CancelFlag = nullptr; // the command this came from is deleted soon
 	switch (InEntry.Action)
 	{
 	case TEXT('A'): Action = TEXT("add"); break;

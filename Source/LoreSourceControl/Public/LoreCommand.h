@@ -56,6 +56,9 @@ public:
 
 	// ---- results (written by the worker) ----
 	std::atomic<bool> bWorkDone{ false };
+	std::atomic<bool> bCancelRequested{ false };     // set by the game thread (Cancel button)
+	std::atomic<bool> bPastPointOfNoReturn{ false }; // e.g. Submit has started committing
+	bool IsCancellable() const;
 	bool bCommandSuccessful = false;
 	TArray<FString> InfoMessages;
 	TArray<FString> WarningMessages;

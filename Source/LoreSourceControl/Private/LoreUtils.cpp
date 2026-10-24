@@ -75,6 +75,10 @@ namespace LoreUtilsLocal
 
 FString FLoreResult::Describe() const
 {
+	if (bCancelled)
+	{
+		return TEXT("Cancelled.");
+	}
 	if (!bLaunched)
 	{
 		return Output.IsEmpty() ? FString(TEXT("Could not start lore.")) : Output;
@@ -95,6 +99,11 @@ FLoreResult LoreUtils::Run(const FLoreContext& Ctx, const TArray<FString>& Args,
 	using namespace LoreUtilsLocal;
 
 	FLoreResult Result;
+	if (Ctx.CancelFlag && Ctx.CancelFlag->load())
+	{
+		Result.bCancelled = true; // cancelled before it started: don't run it
+		return Result;
+	}
 	const FString Dir = WorkingDir.IsEmpty() ? Ctx.RepoRoot : WorkingDir;
 	const FString Binary = Ctx.LoreBinary.IsEmpty() ? FString(TEXT("lore")) : Ctx.LoreBinary;
 
@@ -145,9 +154,11 @@ FLoreResult LoreUtils::Run(const FLoreContext& Ctx, const TArray<FString>& Args,
 	while (FPlatformProcess::IsProcRunning(Proc))
 	{
 		Result.Output += FPlatformProcess::ReadPipe(ReadPipe);
-		if (TimeoutSeconds > 0.0 && FPlatformTime::Seconds() - StartTime > TimeoutSeconds)
+		const bool bCancelNow = Ctx.CancelFlag && Ctx.CancelFlag->load();
+		if (bCancelNow || (TimeoutSeconds > 0.0 && FPlatformTime::Seconds() - StartTime > TimeoutSeconds))
 		{
-			Result.bTimedOut = true;
+			Result.bCancelled = bCancelNow;
+			Result.bTimedOut = !bCancelNow;
 #if PLATFORM_UNIX
 			if (ProcessId != 0)
 			{

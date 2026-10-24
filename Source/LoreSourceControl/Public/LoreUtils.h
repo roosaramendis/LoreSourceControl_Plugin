@@ -11,6 +11,8 @@
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
 
+#include <atomic>
+
 DECLARE_LOG_CATEGORY_EXTERN(LogLoreSC, Log, All);
 
 // Names of the Unreal source control operations we support.
@@ -35,16 +37,18 @@ struct FLoreContext
 	FString Identity;        // --identity value
 	FString ServerUrl;       // lore://host:port
 	FString RepositoryName;  // name on the server
+	const std::atomic<bool>* CancelFlag = nullptr; // set -> running lore is killed, new ones are not started
 };
 
 struct FLoreResult
 {
 	bool bLaunched = false;
 	bool bTimedOut = false;
+	bool bCancelled = false;
 	int32 ExitCode = -1;
 	FString Output;          // stdout + stderr, ANSI colours removed
 
-	bool Ok() const { return bLaunched && !bTimedOut && ExitCode == 0; }
+	bool Ok() const { return bLaunched && !bTimedOut && !bCancelled && ExitCode == 0; }
 	FString Describe() const; // human readable error text
 };
 

@@ -60,8 +60,8 @@ public:
 		const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete()) override;
 
 	virtual bool CanExecuteOperation(const FSourceControlOperationRef& InOperation) const override;
-	virtual bool CanCancelOperation(const FSourceControlOperationRef& InOperation) const override { return false; }
-	virtual void CancelOperation(const FSourceControlOperationRef& InOperation) override {}
+	virtual bool CanCancelOperation(const FSourceControlOperationRef& InOperation) const override;
+	virtual void CancelOperation(const FSourceControlOperationRef& InOperation) override;
 
 	virtual TArray<TSharedRef<class ISourceControlLabel>> GetLabels(const FString& InMatchingSpec) const override;
 	virtual TArray<FSourceControlChangelistRef> GetChangelists(EStateCacheUsage::Type InStateCacheUsage) override;
@@ -131,6 +131,8 @@ private:
 
 	// Async commands waiting for Tick() to pick up their results.
 	TArray<FLoreCommand*> CommandQueue;
+	FLoreCommand* SynchronousCommand = nullptr; // the command a blocking Execute() is waiting for
+	FLoreCommand* FindCommand(const FSourceControlOperationRef& InOperation) const;
 	FQueuedThreadPool* WorkerPool = nullptr;
 
 	FSourceControlStateChanged OnSourceControlStateChanged;

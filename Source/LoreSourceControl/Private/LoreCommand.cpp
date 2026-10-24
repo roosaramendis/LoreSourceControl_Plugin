@@ -986,10 +986,23 @@ namespace LoreWork
 			if (!RunChunked(C, { TEXT("stage") }, ToCommit, LongTimeout, true, &Failed, &LastError))
 			{
 				AddError(C, FString::Printf(TEXT("Nothing was submitted. Could not stage:\n%s\n%s"), *FString::Join(Failed, TEXT("\n")), *LastError));
+				C.Ctx.CancelFlag = nullptr; // clean-up must run even after Cancel
 				Restage();
 				return false;
 			}
 			const FString Message = C.CheckInMessage.TrimStartAndEnd().IsEmpty() ? FString(TEXT("Submitted from Unreal Editor")) : C.CheckInMessage;
+
+			// Last chance to cancel. From here on (commit + push + lock release)
+			// Cancel is ignored, so a submit can never stop half way.
+			if (C.bCancelRequested)
+			{
+				C.Ctx.CancelFlag = nullptr; // so the clean-up below is not cancelled too
+				Restage();
+				return false;
+			}
+			C.bPastPointOfNoReturn = true;
+			C.Ctx.CancelFlag = nullptr;
+			UE_LOG(LogLoreSC, Log, TEXT("Submit: committing %d file(s)..."), ToCommit.Num());
 			const FLoreResult Commit = LoreUtils::Run(C.Ctx, { TEXT("commit"), Message }, LongTimeout);
 			if (!Commit.Ok())
 			{
@@ -1073,7 +1086,15 @@ namespace LoreWork
 
 	static bool RunSync(FLoreCommand& C)
 	{
+		UE_LOG(LogLoreSC, Log, TEXT("Sync: downloading the latest revision..."));
 		const FLoreResult Result = LoreUtils::Run(C.Ctx, { TEXT("sync") }, LongTimeout);
+		if (Result.bCancelled)
+		{
+			// Refresh what we can without the cancel flag, so icons are right.
+			C.Ctx.CancelFlag = nullptr;
+			GatherStatus(C);
+			return false;
+		}
 		if (!Result.Ok())
 		{
 			AddError(C, TEXT("lore sync failed:\n") + Result.Describe());
@@ -1233,11 +1254,32 @@ FLoreCommand::FLoreCommand(const FSourceControlOperationRef& InOperation,
 	, OperationCompleteDelegate(InDelegate)
 	, Kind(InKind)
 {
+	Ctx.CancelFlag = &bCancelRequested;
+}
+
+bool FLoreCommand::IsCancellable() const
+{
+	if (Kind != ELoreCommandKind::Operation || bPastPointOfNoReturn || bWorkDone)
+	{
+		return false;
+	}
+	return (OperationName == LoreOpNames::Sync && SyncRevision.IsEmpty())
+		|| OperationName == LoreOpNames::CheckIn
+		|| OperationName == LoreOpNames::UpdateStatus
+		|| OperationName == LoreOpNames::CheckOut
+		|| OperationName == LoreOpNames::Connect;
 }
 
 void FLoreCommand::DoThreadedWork()
 {
-	bCommandSuccessful = DoWork();
+	if (bCancelRequested)
+	{
+		bCommandSuccessful = false; // cancelled while waiting in the queue
+	}
+	else
+	{
+		bCommandSuccessful = DoWork();
+	}
 	bWorkDone = true;
 }
 

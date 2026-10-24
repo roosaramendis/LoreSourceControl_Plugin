@@ -444,13 +444,27 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 
 	if (InConcurrency == EConcurrency::Synchronous)
 	{
-		FScopedSourceControlProgress Progress(InOperation->GetInProgressString());
+		// The Cancel button only appears for operations that can stop safely.
+		FSimpleDelegate OnCancel;
+		if (Command->IsCancellable())
+		{
+			OnCancel = FSimpleDelegate::CreateLambda([Command]()
+			{
+				if (Command->IsCancellable())
+				{
+					Command->bCancelRequested = true;
+				}
+			});
+		}
+		FScopedSourceControlProgress Progress(InOperation->GetInProgressString(), OnCancel);
+		SynchronousCommand = Command;
 		GetWorkerPool()->AddQueuedWork(Command);
 		while (!Command->bWorkDone)
 		{
 			FPlatformProcess::Sleep(0.01f);
 			Progress.Tick();
 		}
+		SynchronousCommand = nullptr;
 		// Older async commands ran before this one (single thread, FIFO).
 		// Apply their results FIRST so they can't overwrite our newer state.
 		ProcessFinishedQueue();
@@ -626,8 +640,58 @@ void FLoreSourceControlProvider::ReportMessages(const FLoreCommand& Command) con
 	}
 }
 
+FLoreCommand* FLoreSourceControlProvider::FindCommand(const FSourceControlOperationRef& InOperation) const
+{
+	if (SynchronousCommand && &SynchronousCommand->Operation.Get() == &InOperation.Get())
+	{
+		return SynchronousCommand;
+	}
+	for (FLoreCommand* Command : CommandQueue)
+	{
+		if (&Command->Operation.Get() == &InOperation.Get())
+		{
+			return Command;
+		}
+	}
+	return nullptr;
+}
+
+bool FLoreSourceControlProvider::CanCancelOperation(const FSourceControlOperationRef& InOperation) const
+{
+	const FLoreCommand* Command = FindCommand(InOperation);
+	return Command && Command->IsCancellable();
+}
+
+void FLoreSourceControlProvider::CancelOperation(const FSourceControlOperationRef& InOperation)
+{
+	FLoreCommand* Command = FindCommand(InOperation);
+	if (Command && Command->IsCancellable())
+	{
+		Command->bCancelRequested = true;
+	}
+}
+
 ECommandResult::Type FLoreSourceControlProvider::ProcessCompletedCommand(FLoreCommand& Command)
 {
+	// Cancelled: replace the error noise with one clear message.
+	const bool bWasCancelled = Command.bCancelRequested && !Command.bCommandSuccessful;
+	if (bWasCancelled)
+	{
+		Command.ErrorMessages.Reset();
+		if (Command.OperationName == LoreOpNames::Sync)
+		{
+			Command.WarningMessages.Add(TEXT("Sync was cancelled. Some files may already be updated; run Sync again to finish."));
+		}
+		else if (Command.OperationName == LoreOpNames::CheckIn)
+		{
+			Command.WarningMessages.Add(TEXT("Submit was cancelled before anything was committed. Your files and check-outs are unchanged."));
+		}
+		else
+		{
+			Command.InfoMessages.Add(FString::Printf(TEXT("%s was cancelled."), *Command.OperationName.ToString()));
+		}
+	}
+
 	ApplyResults(Command);
 
 	const FSourceControlOperationRef& Operation = Command.Operation;
@@ -675,7 +739,8 @@ ECommandResult::Type FLoreSourceControlProvider::ProcessCompletedCommand(FLoreCo
 
 	ReportMessages(Command);
 
-	const ECommandResult::Type Result = Command.bCommandSuccessful ? ECommandResult::Succeeded : ECommandResult::Failed;
+	const ECommandResult::Type Result = Command.bCommandSuccessful ? ECommandResult::Succeeded
+		: (bWasCancelled ? ECommandResult::Cancelled : ECommandResult::Failed);
 	Command.OperationCompleteDelegate.ExecuteIfBound(Operation, Result);
 	return Result;
 }
