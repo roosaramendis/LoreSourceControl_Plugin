@@ -1,6 +1,8 @@
 #include "LoreCommand.h"
 
 #include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/Guid.h"
 #include "Misc/Paths.h"
 
 // All the "what lore commands do we run for operation X" logic lives here.
@@ -944,6 +946,129 @@ namespace LoreWork
 		return Result.Ok();
 	}
 
+	// Rollback: put an old revision of each file on disk as a local change.
+	// Submitting it afterwards makes that old content the newest revision;
+	// Revert brings the current revision back.
+	static bool RunSyncToRevision(FLoreCommand& C)
+	{
+		TArray<FString> Rels, Dirs;
+		SplitFiles(C, Rels, Dirs);
+		if (Dirs.Num() > 0)
+		{
+			AddError(C, TEXT("Restoring a revision only works on files, not folders."));
+			return false;
+		}
+		TMap<FString, FLoreFileStatus> States;
+		RefreshFiles(C, Rels, States, true);
+		if (C.ErrorMessages.Num() > 0)
+		{
+			return false;
+		}
+
+		const bool bIsNumber = C.SyncRevision.IsNumeric();
+		bool bOk = true;
+		for (const FString& Rel : Rels)
+		{
+			const FLoreFileStatus* Status = States.Find(Rel);
+			if (!Status || Status->State == ELoreWorkingState::NotTracked || Status->State == ELoreWorkingState::Added)
+			{
+				AddError(C, FString::Printf(TEXT("%s has no submitted revisions to restore."), *Rel));
+				bOk = false;
+				continue;
+			}
+			if (Status->Lock == ELoreLockState::Other)
+			{
+				AddError(C, FString::Printf(TEXT("Cannot restore %s: it is checked out by %s."), *Rel, *OwnerText(Status->LockOwner)));
+				bOk = false;
+				continue;
+			}
+
+			// 1. Find the revision (and make sure we are at the newest one, so
+			//    the restored content is submitted on top of it).
+			const FLoreResult History = LoreUtils::Run(C.Ctx, { TEXT("file"), TEXT("history"), Rel, TEXT("1000") }, ShortTimeout);
+			TArray<FLoreHistoryEntry> Entries;
+			if (History.Ok())
+			{
+				LoreUtils::ParseFileHistory(History.Output, Entries);
+			}
+			const FLoreHistoryEntry* Target = nullptr;
+			for (const FLoreHistoryEntry& Entry : Entries)
+			{
+				if ((bIsNumber && Entry.Number == FCString::Atoi(*C.SyncRevision)) || (!bIsNumber && Entry.Signature == C.SyncRevision))
+				{
+					Target = &Entry;
+					break;
+				}
+			}
+			if (!Target)
+			{
+				AddError(C, FString::Printf(TEXT("Revision %s of %s was not found in its history."), *C.SyncRevision, *Rel));
+				bOk = false;
+				continue;
+			}
+			const FLoreResult Remote = LoreUtils::Run(C.Ctx, { TEXT("--remote"), TEXT("file"), TEXT("history"), Rel, TEXT("1"), TEXT("--oneline") }, ShortTimeout);
+			if (Remote.Ok() && Entries.Num() > 0)
+			{
+				const TOptional<int32> RemoteRev = LoreUtils::ParseFirstHistoryRevision(Remote.Output);
+				if (RemoteRev.IsSet() && RemoteRev.GetValue() > Entries[0].Number)
+				{
+					AddError(C, FString::Printf(TEXT("%s has a newer version on the server (revision %d). Sync first, then restore."), *Rel, RemoteRev.GetValue()));
+					bOk = false;
+					continue;
+				}
+			}
+
+			// 2. Check it out (a restore is an edit like any other).
+			if (Status->Lock == ELoreLockState::None)
+			{
+				const FLoreResult Acquire = LoreUtils::Run(C.Ctx, { TEXT("lock"), TEXT("acquire"), Rel }, ShortTimeout);
+				const FLoreResult LockStatus = LoreUtils::Run(C.Ctx, { TEXT("lock"), TEXT("status"), Rel }, ShortTimeout);
+				TMap<FString, FString> Locks;
+				LoreUtils::ParseLocks(LockStatus.Output, Locks);
+				const FString* Owner = Locks.Find(Rel);
+				if (!Acquire.Ok() || !Owner)
+				{
+					AddError(C, FString::Printf(TEXT("Could not check out %s:\n%s"), *Rel, *Acquire.Describe()));
+					bOk = false;
+					continue;
+				}
+				C.LockStore->Add(Rel, *Owner);
+			}
+
+			// 3. Lore refuses to write inside the repository, so extract to the
+			//    temp folder first, then copy over the real file.
+			const FString TempFile = FPaths::Combine(FString(FPlatformProcess::UserTempDir()),
+				FString::Printf(TEXT("lore_restore_%s%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits), *FPaths::GetExtension(Rel, true)));
+			TArray<FString> WriteArgs = { TEXT("file"), TEXT("write") };
+			if (!Target->Address.IsEmpty())
+			{
+				WriteArgs.Append({ TEXT("--address"), Target->Address });
+			}
+			else
+			{
+				WriteArgs.Append({ TEXT("--path"), Rel, TEXT("--revision"), Target->Signature });
+			}
+			WriteArgs.Append({ TEXT("--output"), TempFile });
+			const FLoreResult Write = LoreUtils::Run(C.Ctx, WriteArgs, LongTimeout);
+			const FString Abs = LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Rel);
+			const bool bCopied = Write.Ok() && IFileManager::Get().Copy(*Abs, *TempFile, true, true) == COPY_OK;
+			IFileManager::Get().Delete(*TempFile, false, true, true);
+			if (!bCopied)
+			{
+				AddError(C, FString::Printf(TEXT("Could not restore revision %d of %s:\n%s"), Target->Number, *Rel, *Write.Describe()));
+				bOk = false;
+				continue;
+			}
+			LoreUtils::Run(C.Ctx, { TEXT("dirty"), Rel }, ShortTimeout);
+			C.InfoMessages.Add(FString::Printf(TEXT("Restored revision %d of %s. Submit to make it the latest revision, or Revert to undo."), Target->Number, *Rel));
+		}
+
+		TMap<FString, FLoreFileStatus> After;
+		RefreshFiles(C, Rels, After, true);
+		AddStatuses(C, After);
+		return bOk;
+	}
+
 	static bool RunBackgroundRefresh(FLoreCommand& C)
 	{
 		const bool bOk = ReadRepoInfo(C);
@@ -995,7 +1120,7 @@ bool FLoreCommand::DoWork()
 	if (OperationName == LoreOpNames::MarkForAdd)    { return RunMarkForAdd(*this); }
 	if (OperationName == LoreOpNames::Delete)        { return RunDelete(*this); }
 	if (OperationName == LoreOpNames::Revert)        { return RunRevert(*this); }
-	if (OperationName == LoreOpNames::Sync)          { return RunSync(*this); }
+	if (OperationName == LoreOpNames::Sync)          { return SyncRevision.IsEmpty() ? RunSync(*this) : RunSyncToRevision(*this); }
 
 	AddError(*this, FString::Printf(TEXT("Operation %s is not supported by the Lore provider."), *OperationName.ToString()));
 	return false;

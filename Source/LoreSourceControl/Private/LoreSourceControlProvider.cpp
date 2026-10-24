@@ -369,6 +369,10 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 	{
 		bConnectInFlight = true;
 	}
+	else if (OpName == LoreOpNames::Sync)
+	{
+		Command->SyncRevision = StaticCastSharedRef<FSync>(InOperation)->GetRevision();
+	}
 	else if (OpName == LoreOpNames::UpdateStatus)
 	{
 		Command->bUpdateHistory = StaticCastSharedRef<FUpdateStatus>(InOperation)->ShouldUpdateHistory();

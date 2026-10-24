@@ -16,5 +16,7 @@ public:
 	static bool IsLoaded();
 
 private:
+	void RegisterMenus();
+
 	FLoreSourceControlProvider LoreProvider;
 };
