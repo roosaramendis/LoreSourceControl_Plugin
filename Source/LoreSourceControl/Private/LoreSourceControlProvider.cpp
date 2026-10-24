@@ -6,6 +6,10 @@
 
 #include "ISourceControlLabel.h"
 #include "SourceControlHelpers.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Misc/PackageName.h"
+#include "Modules/ModuleManager.h"
 #include "SourceControlOperations.h"
 #include "ScopedSourceControlProgress.h"
 #include "HAL/PlatformProcess.h"
@@ -47,6 +51,7 @@ namespace LoreProviderLocal
 FLoreSourceControlProvider::FLoreSourceControlProvider()
 	: ProviderName(TEXT("Lore"))
 	, LockStore(MakeShared<FLoreLockStore, ESPMode::ThreadSafe>())
+	, MoveStore(MakeShared<FLoreMoveStore, ESPMode::ThreadSafe>())
 {
 }
 
@@ -160,6 +165,15 @@ void FLoreSourceControlProvider::Init(bool bForceConnection)
 	LoadSettings();
 	RefreshRepoRoot();
 	LockStore->SetFile(FPaths::ProjectSavedDir() / TEXT("LoreSourceControl") / TEXT("MyLocks.txt"));
+	MoveStore->SetFile(FPaths::ProjectSavedDir() / TEXT("LoreSourceControl") / TEXT("PendingMoves.txt"));
+
+	// Unreal never tells revision control about renames, so listen for them
+	// ourselves and turn them into `lore stage move` on Mark For Add / Submit.
+	if (!AssetRenamedHandle.IsValid())
+	{
+		FAssetRegistryModule& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		AssetRenamedHandle = AssetRegistry.Get().OnAssetRenamed().AddRaw(this, &FLoreSourceControlProvider::HandleAssetRenamed);
+	}
 
 	// Never block editor startup: the connection check runs in the background
 	// and Tick() picks up the answer.
@@ -171,6 +185,14 @@ void FLoreSourceControlProvider::Init(bool bForceConnection)
 
 void FLoreSourceControlProvider::Close()
 {
+	if (AssetRenamedHandle.IsValid())
+	{
+		if (FModuleManager::Get().IsModuleLoaded(TEXT("AssetRegistry")))
+		{
+			FModuleManager::GetModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().OnAssetRenamed().Remove(AssetRenamedHandle);
+		}
+		AssetRenamedHandle.Reset();
+	}
 	if (WorkerPool)
 	{
 		WorkerPool->Destroy(); // waits for the running command, abandons queued ones
@@ -187,6 +209,47 @@ void FLoreSourceControlProvider::Close()
 	bConnectInFlight = false;
 	bRefreshInFlight = false;
 	bHasConnectedOnce = false;
+}
+
+void FLoreSourceControlProvider::HandleAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath)
+{
+	if (!bRepoFound)
+	{
+		return;
+	}
+	const FString NewPackage = AssetData.PackageName.ToString();
+	const FString OldPackage = FPackageName::ObjectPathToPackageName(OldObjectPath);
+	if (OldPackage.IsEmpty() || OldPackage == NewPackage)
+	{
+		return; // renamed inside the same package: no file moved
+	}
+	const FString Extension = (AssetData.PackageFlags & PKG_ContainsMap) ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension();
+	FString NewFile, OldFile;
+	if (!FPackageName::TryConvertLongPackageNameToFilename(NewPackage, NewFile, Extension)
+		|| !FPackageName::TryConvertLongPackageNameToFilename(OldPackage, OldFile, Extension))
+	{
+		return;
+	}
+	FString NewRel, OldRel;
+	if (!LoreUtils::ToRelative(RepoRoot, LoreUtils::NormalizePath(NewFile), NewRel)
+		|| !LoreUtils::ToRelative(RepoRoot, LoreUtils::NormalizePath(OldFile), OldRel))
+	{
+		return;
+	}
+
+	// A -> B then B -> C is one move A -> C. Moving back to A cancels it.
+	FString Original;
+	if (MoveStore->Find(OldRel, Original))
+	{
+		MoveStore->Remove(OldRel);
+		OldRel = Original;
+	}
+	if (OldRel == NewRel)
+	{
+		return;
+	}
+	MoveStore->Add(NewRel, OldRel);
+	UE_LOG(LogLoreSC, Log, TEXT("Rename noted: %s -> %s (recorded as a Lore move on submit)"), *OldRel, *NewRel);
 }
 
 FQueuedThreadPool* FLoreSourceControlProvider::GetWorkerPool()
@@ -355,6 +418,7 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 	}
 
 	FLoreCommand* Command = new FLoreCommand(InOperation, AbsFiles, MakeContext(), LockStore, InOperationCompleteDelegate);
+	Command->MoveStore = MoveStore;
 	if (OpName == LoreOpNames::CheckIn)
 	{
 		TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = StaticCastSharedRef<FCheckIn>(InOperation);
@@ -556,7 +620,9 @@ void FLoreSourceControlProvider::ReportMessages(const FLoreCommand& Command) con
 	}
 	else if (Command.WarningMessages.Num() > 0)
 	{
-		Log.Notify(LOCTEXT("OpWarning", "Lore: see the Revision Control log."), EMessageSeverity::Warning, true);
+		Log.Notify(Command.WarningMessages.Num() == 1
+			? FText::FromString(Command.WarningMessages[0])
+			: LOCTEXT("OpWarning", "Lore: see the Revision Control log."), EMessageSeverity::Warning, true);
 	}
 }
 

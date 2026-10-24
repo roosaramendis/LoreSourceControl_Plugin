@@ -15,6 +15,7 @@
 class FLoreSourceControlState;
 class FLoreCommand;
 class FQueuedThreadPool;
+struct FAssetData;
 
 struct FLoreSettings
 {
@@ -96,6 +97,8 @@ private:
 	FQueuedThreadPool* GetWorkerPool();
 	void ProcessFinishedQueue();
 
+	void HandleAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath);
+
 	TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& AbsPath);
 	void ApplyResults(FLoreCommand& Command);
 	ECommandResult::Type ProcessCompletedCommand(FLoreCommand& Command);
@@ -103,6 +106,8 @@ private:
 
 	FName ProviderName;
 	TSharedRef<FLoreLockStore, ESPMode::ThreadSafe> LockStore;
+	TSharedRef<FLoreMoveStore, ESPMode::ThreadSafe> MoveStore; // renames waiting to be submitted (new -> old)
+	FDelegateHandle AssetRenamedHandle;
 	FLoreSettings Settings;
 
 	// Repository on disk

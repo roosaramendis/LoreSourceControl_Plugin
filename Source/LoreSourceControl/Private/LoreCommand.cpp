@@ -126,6 +126,10 @@ namespace LoreWork
 			{
 				bUnstagedAdd = true;
 			}
+			else if (Entry.Code == TEXT('V') && Entry.bStaged)
+			{
+				bStagedAdd = true; // "V old -> new": moved here, treat like an add (revert = unstage, never reset)
+			}
 		}
 		if (bDeleted) { return ELoreWorkingState::Deleted; }
 		if (bStagedAdd) { return ELoreWorkingState::Added; }   // marked for add
@@ -639,6 +643,92 @@ namespace LoreWork
 		return bOk;
 	}
 
+	// Releases locks this machine owns. A lock on a path that is no longer in
+	// the repository (deleted, or moved away) can only be released with
+	// --force; only used for our own locks, so it never takes someone else's.
+	// "Lock does not exist" counts as released. Returns the paths still locked.
+	static TArray<FString> ReleaseMyLocks(FLoreCommand& C, const TArray<FString>& Rels)
+	{
+		TArray<FString> StillLocked;
+		for (int32 Start = 0; Start < Rels.Num(); Start += ChunkSize)
+		{
+			const TArray<FString> Chunk = Slice(Rels, Start, ChunkSize);
+			TArray<FString> Args = { TEXT("lock"), TEXT("release") };
+			Args.Append(Chunk);
+			if (LoreUtils::Run(C.Ctx, Args, ShortTimeout).Ok())
+			{
+				continue;
+			}
+			for (const FString& Rel : Chunk)
+			{
+				const FLoreResult Normal = LoreUtils::Run(C.Ctx, { TEXT("lock"), TEXT("release"), Rel }, ShortTimeout);
+				if (Normal.Ok() || Normal.Output.Contains(TEXT("does not exist")))
+				{
+					continue;
+				}
+				const FLoreResult Forced = LoreUtils::Run(C.Ctx, { TEXT("lock"), TEXT("release"), TEXT("--force"), Rel }, ShortTimeout);
+				if (!Forced.Ok() && !Forced.Output.Contains(TEXT("does not exist")))
+				{
+					StillLocked.Add(Rel);
+				}
+			}
+		}
+		for (const FString& Rel : Rels)
+		{
+			if (!StillLocked.Contains(Rel))
+			{
+				C.LockStore->Remove(Rel);
+			}
+		}
+		return StillLocked;
+	}
+
+	// Records "OldRel was renamed to NewRel" with `lore stage move`, so the
+	// file keeps its history. Lore only records the move: the file must
+	// already be at NewRel on disk (Unreal did that). Returns false when Lore
+	// refuses (e.g. OldRel was never submitted); the file is then just added.
+	static bool StageMove(FLoreCommand& C, const FString& OldRel, const FString& NewRel)
+	{
+		if (!FPaths::FileExists(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, NewRel)))
+		{
+			return false;
+		}
+		// Only a file that is in the current revision can be moved. Lore 0.8.4
+		// does not refuse an unknown source path: it silently links the new file
+		// to some unrelated deleted file's history. So check first.
+		const FLoreResult InfoCheck = LoreUtils::Run(C.Ctx, { TEXT("file"), TEXT("info"), OldRel }, ShortTimeout);
+		if (!InfoCheck.Ok() || !InfoCheck.Output.Contains(TEXT("Type:")))
+		{
+			UE_LOG(LogLoreSC, Log, TEXT("Not recording %s -> %s as a move: %s was never submitted, adding it as a new file."), *OldRel, *NewRel, *OldRel);
+			if (C.MoveStore.IsValid())
+			{
+				C.MoveStore->Remove(NewRel);
+			}
+			return false;
+		}
+		const FLoreResult Status = LoreUtils::Run(C.Ctx, { TEXT("status") }, ShortTimeout);
+		if (Status.Ok())
+		{
+			FLoreRepoInfo Info;
+			LoreUtils::ParseStatus(Status.Output, Info);
+			for (const FLoreStatusEntry& Entry : Info.Entries)
+			{
+				if (Entry.Code == TEXT('V') && Entry.bStaged && Entry.RelPath == NewRel)
+				{
+					return true; // already recorded
+				}
+			}
+		}
+		const FLoreResult Move = LoreUtils::Run(C.Ctx, { TEXT("stage"), TEXT("move"), OldRel, NewRel }, ShortTimeout);
+		if (!Move.Ok())
+		{
+			UE_LOG(LogLoreSC, Log, TEXT("Not recording %s -> %s as a move: %s"), *OldRel, *NewRel, *Move.Describe());
+			return false;
+		}
+		UE_LOG(LogLoreSC, Log, TEXT("Recorded move %s -> %s"), *OldRel, *NewRel);
+		return true;
+	}
+
 	static bool RunMarkForAdd(FLoreCommand& C)
 	{
 		TArray<FString> Rels, Dirs;
@@ -649,6 +739,19 @@ namespace LoreWork
 		{
 			if (FPaths::FileExists(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Rel))) { Existing.Add(Rel); }
 			else { AddError(C, FString::Printf(TEXT("Cannot mark %s for add: the file does not exist."), *Rel)); }
+		}
+
+		// Files Unreal just renamed: record the move first so history follows.
+		if (C.MoveStore.IsValid())
+		{
+			for (const FString& Rel : Existing)
+			{
+				FString OldRel;
+				if (C.MoveStore->Find(Rel, OldRel))
+				{
+					StageMove(C, OldRel, Rel);
+				}
+			}
 		}
 
 		RunChunked(C, { TEXT("dirty") }, Existing, ShortTimeout, true);
@@ -715,6 +818,19 @@ namespace LoreWork
 		{
 			const FLoreFileStatus* Status = States.Find(Rel);
 			const ELoreWorkingState State = Status ? Status->State : ELoreWorkingState::Unknown;
+
+			// A renamed asset: never reset (that could delete it), only unstage,
+			// and tell the user how to undo a rename.
+			FString RenamedFrom;
+			if (C.MoveStore.IsValid() && C.MoveStore->Find(Rel, RenamedFrom))
+			{
+				ToUnstage.Add(Rel);
+				C.WarningMessages.Add(FString::Printf(
+					TEXT("%s was renamed from %s. Revert does not undo a rename. To undo it: right-click the folder -> Fix Up Redirectors, then rename the asset back to %s (the recorded move is then cancelled)."),
+					*FPaths::GetBaseFilename(Rel), *FPaths::GetBaseFilename(RenamedFrom), *FPaths::GetBaseFilename(RenamedFrom)));
+				continue;
+			}
+
 			if (State == ELoreWorkingState::Modified || State == ELoreWorkingState::Deleted)
 			{
 				ToReset.Add(Rel);
@@ -749,15 +865,7 @@ namespace LoreWork
 
 		if (ToRelease.Num() > 0)
 		{
-			TArray<FString> Failed;
-			RunChunked(C, { TEXT("lock"), TEXT("release") }, ToRelease, ShortTimeout, true, &Failed);
-			for (const FString& Rel : ToRelease)
-			{
-				if (!Failed.Contains(Rel))
-				{
-					C.LockStore->Remove(Rel);
-				}
-			}
+			const TArray<FString> Failed = ReleaseMyLocks(C, ToRelease);
 			if (Failed.Num() > 0)
 			{
 				C.WarningMessages.Add(TEXT("Reverted, but could not release the check-out of: ") + FString::Join(Failed, TEXT(", ")));
@@ -847,7 +955,29 @@ namespace LoreWork
 			}
 		};
 
-		// 3. Stage the selected files and commit.
+		// 3a. Renames recorded from Unreal: tell Lore they are moves so the
+		//     history follows the asset. If the old file is gone (no
+		//     redirector left), the move already covers its deletion.
+		TArray<FString> MovedNew;
+		TSet<FString> MovedAwayOld;
+		if (C.MoveStore.IsValid())
+		{
+			for (const FString& Rel : ToCommit)
+			{
+				FString OldRel;
+				if (C.MoveStore->Find(Rel, OldRel) && StageMove(C, OldRel, Rel))
+				{
+					MovedNew.Add(Rel);
+					if (!FPaths::FileExists(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, OldRel)))
+					{
+						MovedAwayOld.Add(OldRel);
+					}
+				}
+			}
+			ToCommit.RemoveAll([&MovedAwayOld](const FString& Rel) { return MovedAwayOld.Contains(Rel); });
+		}
+
+		// 3b. Stage the selected files and commit.
 		int32 NewRevision = INDEX_NONE;
 		if (ToCommit.Num() > 0)
 		{
@@ -904,19 +1034,29 @@ namespace LoreWork
 		}
 		if (ToRelease.Num() > 0)
 		{
-			TArray<FString> Failed;
-			RunChunked(C, { TEXT("lock"), TEXT("release") }, ToRelease, ShortTimeout, true, &Failed);
-			for (const FString& Rel : ToRelease)
-			{
-				if (!Failed.Contains(Rel))
-				{
-					C.LockStore->Remove(Rel);
-				}
-			}
+			const TArray<FString> Failed = ReleaseMyLocks(C, ToRelease);
 			if (Failed.Num() > 0)
 			{
 				C.WarningMessages.Add(TEXT("Submitted, but could not release the check-out of: ") + FString::Join(Failed, TEXT(", ")));
 			}
+		}
+		// The lock stays on the OLD path after a move (Lore does not move it).
+		TArray<FString> OldLocks;
+		for (const FString& OldRel : MovedAwayOld)
+		{
+			FString StoredOwner;
+			if (C.LockStore->Find(OldRel, StoredOwner) && !ToRelease.Contains(OldRel))
+			{
+				OldLocks.Add(OldRel);
+			}
+		}
+		if (OldLocks.Num() > 0)
+		{
+			ReleaseMyLocks(C, OldLocks);
+		}
+		for (const FString& Rel : MovedNew)
+		{
+			C.MoveStore->Remove(Rel); // submitted: the move is now part of the history
 		}
 
 		Restage();

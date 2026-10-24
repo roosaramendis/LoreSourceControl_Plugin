@@ -135,6 +135,10 @@ private:
 	FString FilePath;
 };
 
+// Same "path<TAB>text" file format, used for moves recorded from Unreal
+// renames: new repo-relative path -> old repo-relative path.
+using FLoreMoveStore = FLoreLockStore;
+
 namespace LoreUtils
 {
 	// Runs `lore <global options> <Args...>` inside WorkingDir (defaults to Ctx.RepoRoot).

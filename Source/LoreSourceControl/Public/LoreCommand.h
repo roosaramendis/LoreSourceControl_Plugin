@@ -51,6 +51,7 @@ public:
 	bool bSoftRevert = false;
 	bool bKeepCheckedOut = false;          // "Keep files checked out" in the Submit dialog
 	bool bUpdateHistory = false;           // UpdateStatus: also read file history
+	TSharedPtr<FLoreMoveStore, ESPMode::ThreadSafe> MoveStore; // pending renames (new -> old)
 	FString SyncRevision;                  // Sync: restore files to this revision (number or signature); empty = sync the branch
 
 	// ---- results (written by the worker) ----

@@ -22,6 +22,7 @@ public class LoreSourceControl : ModuleRules
 			"InputCore",
 			"ToolMenus",
 			"ContentBrowser",
+			"AssetRegistry",
 		});
 	}
 }
