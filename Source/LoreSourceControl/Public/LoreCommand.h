@@ -53,6 +53,10 @@ public:
 	bool bUpdateHistory = false;           // UpdateStatus: also read file history
 	TSharedPtr<FLoreMoveStore, ESPMode::ThreadSafe> MoveStore; // pending renames (new -> old)
 	FString SyncRevision;                  // Sync: restore files to this revision (number or signature); empty = sync the branch
+	// Sync: assets changed both here and on the server (they can't be merged).
+	// Absolute paths; the user picked one side in a dialog before the sync.
+	TSet<FString> ResolveKeepMine;         // keep my version (it replaces theirs when I submit)
+	TSet<FString> ResolveTakeTheirs;       // take the server version (mine is backed up)
 
 	// ---- results (written by the worker) ----
 	std::atomic<bool> bWorkDone{ false };
@@ -70,6 +74,8 @@ public:
 	bool bHasRepoInfo = false;
 	FLoreRepoInfo RepoInfo;
 	FString SuccessMessage;
+	bool bHasOutOfDate = false;            // true -> OutOfDateFiles is the complete, current list
+	TArray<FString> OutOfDateFiles;        // absolute paths changed on the server since our revision
 	TMap<FString, TArray<FLoreHistoryEntry>> Histories; // absolute path -> newest first
 
 private:

@@ -15,7 +15,8 @@ FLoreSourceControlRevision::FLoreSourceControlRevision(const FString& InFilename
 	{
 	case TEXT('A'): Action = TEXT("add"); break;
 	case TEXT('D'): Action = TEXT("delete"); break;
-	case TEXT('R'): Action = TEXT("move/add"); break;
+	case TEXT('R'):
+	case TEXT('V'): Action = TEXT("move/add"); break;
 	default:        Action = TEXT("edit"); break;
 	}
 }

@@ -48,6 +48,23 @@ namespace LoreUtilsLocal
 		return Out;
 	}
 
+	// "... revision 25 -> 7650e85f..." -> "7650e85f..."
+	static FString HashAfterArrow(const FString& Line)
+	{
+		const int32 Arrow = Line.Find(TEXT("-> "), ESearchCase::CaseSensitive);
+		if (Arrow == INDEX_NONE)
+		{
+			return FString();
+		}
+		FString Hash = Line.Mid(Arrow + 3).TrimStartAndEnd();
+		int32 Space = INDEX_NONE;
+		if (Hash.FindChar(TEXT(' '), Space))
+		{
+			Hash.LeftInline(Space);
+		}
+		return Hash;
+	}
+
 	static TOptional<int32> ParseNumberAfter(const FString& Line, const TCHAR* Marker)
 	{
 		const int32 Index = Line.Find(Marker, ESearchCase::CaseSensitive);
@@ -325,6 +342,7 @@ void LoreUtils::ParseStatus(const FString& Output, FLoreRepoInfo& OutInfo)
 		if (Line.StartsWith(TEXT("On branch ")))
 		{
 			OutInfo.LocalRevision = ParseNumberAfter(Line, TEXT(" revision "));
+			OutInfo.LocalHash = HashAfterArrow(Line);
 			FString Branch = Line.Mid(10);
 			const int32 RevIndex = Branch.Find(TEXT(" revision "), ESearchCase::CaseSensitive);
 			if (RevIndex != INDEX_NONE)
@@ -337,6 +355,7 @@ void LoreUtils::ParseStatus(const FString& Output, FLoreRepoInfo& OutInfo)
 		if (Line.StartsWith(TEXT("Remote revision ")))
 		{
 			OutInfo.RemoteRevision = ParseNumberAfter(Line, TEXT("Remote revision "));
+			OutInfo.RemoteHash = HashAfterArrow(Line);
 			continue;
 		}
 		if (Line.StartsWith(TEXT("Remote branch does not exist")))
@@ -612,6 +631,32 @@ void LoreUtils::ParseFileHistory(const FString& Output, TArray<FLoreHistoryEntry
 	Finish();
 }
 
+void LoreUtils::ParseRevisionDiff(const FString& Output, TArray<FString>& OutRelPaths)
+{
+	// "M Config/DefaultGame.ini", "A other_test.txt", "V old -> new"
+	TArray<FString> Lines;
+	Output.ParseIntoArrayLines(Lines, true);
+	for (const FString& Raw : Lines)
+	{
+		const FString Line = Raw.TrimStartAndEnd();
+		if (Line.Len() < 3 || Line[1] != TEXT(' ') || !FChar::IsUpper(Line[0]))
+		{
+			continue;
+		}
+		FString Path = Line.Mid(2).TrimStartAndEnd();
+		FString From, To;
+		if (Path.Split(TEXT(" -> "), &From, &To))
+		{
+			OutRelPaths.AddUnique(From.TrimStartAndEnd());
+			OutRelPaths.AddUnique(To.TrimStartAndEnd());
+		}
+		else if (!Path.IsEmpty())
+		{
+			OutRelPaths.AddUnique(Path);
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // FLoreLockStore
 // ---------------------------------------------------------------------------
@@ -689,4 +734,50 @@ void FLoreLockStore::SaveLocked() const
 	}
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(FilePath), true);
 	FFileHelper::SaveStringToFile(Text, *FilePath);
+}
+
+bool LoreUtils::IsMergeableText(const FString& Path)
+{
+	static const TSet<FString> TextExtensions = {
+		TEXT("ini"), TEXT("txt"), TEXT("json"), TEXT("csv"), TEXT("tsv"), TEXT("xml"), TEXT("md"),
+		TEXT("yaml"), TEXT("yml"), TEXT("uproject"), TEXT("uplugin"),
+		TEXT("h"), TEXT("hpp"), TEXT("c"), TEXT("cpp"), TEXT("inl"), TEXT("cs"), TEXT("py"),
+		TEXT("usf"), TEXT("ush")
+	};
+	return TextExtensions.Contains(FPaths::GetExtension(Path).ToLower());
+}
+
+int32 LoreUtils::Merge3(const FString& Mine, const FString& Base, const FString& Theirs, const FString& OutFile, FString& OutMessage)
+{
+	using namespace LoreUtilsLocal;
+
+	// diff3 writes the merged file itself (stdout redirected into OutFile),
+	// so the bytes are never converted through FString.
+	// The -L labels show up in conflict markers: "<<<<<<< yours".
+	const FString Script = FString::Printf(
+		TEXT("#!/bin/bash\nexport LC_ALL=C\ncommand -v diff3 >/dev/null 2>&1 || { echo 'diff3 is not installed (package: diffutils)'; exit 98; }\n")
+		TEXT("diff3 -m -L yours -L base -L 'theirs (server)' %s %s %s > %s\n"),
+		*ShellQuote(Mine), *ShellQuote(Base), *ShellQuote(Theirs), *ShellQuote(OutFile));
+
+	const FString ScriptPath = FPaths::Combine(FString(FPlatformProcess::UserTempDir()),
+		FString::Printf(TEXT("lore_merge_%s.sh"), *FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+	if (!FFileHelper::SaveStringToFile(Script, *ScriptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		OutMessage = FString::Printf(TEXT("Could not write temporary script %s"), *ScriptPath);
+		return -1;
+	}
+
+	int32 ReturnCode = -1;
+	FString StdOut, StdErr;
+	const bool bRan = FPlatformProcess::ExecProcess(TEXT("/bin/bash"), *ScriptPath, &ReturnCode, &StdOut, &StdErr);
+	IFileManager::Get().Delete(*ScriptPath, false, true, true);
+
+	OutMessage = (StdOut + StdErr).TrimStartAndEnd();
+	if (!bRan)
+	{
+		OutMessage = TEXT("Could not start /bin/bash to run diff3.");
+		return -1;
+	}
+	UE_LOG(LogLoreSC, Verbose, TEXT("diff3 %s -> exit %d %s"), *Theirs, ReturnCode, *OutMessage);
+	return ReturnCode;
 }

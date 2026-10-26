@@ -194,6 +194,44 @@ namespace LoreWork
 		return true;
 	}
 
+	// When the server is ahead, ask Lore which files changed between our
+	// revision and the server's. Those files are "not at head": Unreal then
+	// enables Sync for them and shows the out-of-date icon (like Perforce).
+	static void UpdateOutOfDate(FLoreCommand& C)
+	{
+		if (!C.bHasRepoInfo)
+		{
+			return;
+		}
+		const FLoreRepoInfo& Info = C.RepoInfo;
+		const bool bBehind = Info.LocalRevision.IsSet() && Info.RemoteRevision.IsSet()
+			&& Info.RemoteRevision.GetValue() > Info.LocalRevision.GetValue()
+			&& !Info.LocalHash.IsEmpty() && !Info.RemoteHash.IsEmpty();
+		if (!bBehind)
+		{
+			C.bHasOutOfDate = true; // up to date: nothing is out of date
+			C.OutOfDateFiles.Reset();
+			return;
+		}
+		FLoreResult Diff = LoreUtils::Run(C.Ctx, { TEXT("revision"), TEXT("diff"), Info.LocalHash, TEXT("--target"), Info.RemoteHash }, ShortTimeout);
+		if (!Diff.Ok())
+		{
+			Diff = LoreUtils::Run(C.Ctx, { TEXT("--remote"), TEXT("revision"), TEXT("diff"), Info.LocalHash, TEXT("--target"), Info.RemoteHash }, ShortTimeout);
+		}
+		if (!Diff.Ok())
+		{
+			return; // unknown: keep what the editor had
+		}
+		TArray<FString> Rels;
+		LoreUtils::ParseRevisionDiff(Diff.Output, Rels);
+		C.bHasOutOfDate = true;
+		C.OutOfDateFiles.Reset();
+		for (const FString& Rel : Rels)
+		{
+			C.OutOfDateFiles.Add(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Rel));
+		}
+	}
+
 	static bool ReadRepoInfo(FLoreCommand& C, FLoreRepoInfo* OutFullInfo = nullptr)
 	{
 		const FLoreResult Result = LoreUtils::Run(C.Ctx, { TEXT("status") }, ShortTimeout);
@@ -379,6 +417,23 @@ namespace LoreWork
 
 		// Directories (the editor asks for Content/, Config/ ... before "Submit
 		// Content"): walk the filesystem with --scan to find every change.
+		// Unreal lists config files in Submit Content only when revision control
+		// already reports them as changed, but it only asks us to scan the
+		// content folders. So whenever it asks for a folder scan, scan the
+		// project's Config folder too.
+		if (RelDirs.Num() > 0 && FPaths::DirectoryExists(Root / TEXT("Config")))
+		{
+			bool bConfigCovered = false;
+			for (const FString& Dir : RelDirs)
+			{
+				bConfigCovered |= Dir == TEXT(".") || Dir == TEXT("Config") || Dir.StartsWith(TEXT("Config/"));
+			}
+			if (!bConfigCovered)
+			{
+				RelDirs.Add(TEXT("Config"));
+			}
+		}
+
 		if (RelDirs.Num() > 0)
 		{
 			TArray<FLoreStatusEntry> Entries;
@@ -534,6 +589,7 @@ namespace LoreWork
 			}
 		}
 		QueryAllLocks(C);
+		UpdateOutOfDate(C);
 		return true;
 	}
 
@@ -878,6 +934,284 @@ namespace LoreWork
 		return bOk;
 	}
 
+	// "[Error] File has local changes: Config/X.ini (incoming size ...)" -> paths.
+	static TArray<FString> ParseSyncBlockers(const FString& Output)
+	{
+		static const FString Marker = TEXT("File has local changes: ");
+		TArray<FString> Lines, Blockers;
+		Output.ParseIntoArrayLines(Lines, true);
+		for (const FString& Line : Lines)
+		{
+			const int32 Start = Line.Find(Marker, ESearchCase::CaseSensitive);
+			if (Start == INDEX_NONE)
+			{
+				continue;
+			}
+			FString Path = Line.Mid(Start + Marker.Len());
+			const int32 Paren = Path.Find(TEXT(" ("), ESearchCase::CaseSensitive);
+			if (Paren != INDEX_NONE)
+			{
+				Path.LeftInline(Paren);
+			}
+			Blockers.AddUnique(Path.TrimStartAndEnd());
+		}
+		return Blockers;
+	}
+
+	static FString DescribeSyncFailure(const FLoreResult& Result)
+	{
+		const TArray<FString> Blockers = ParseSyncBlockers(Result.Output);
+		if (Blockers.Num() > 0)
+		{
+			return TEXT("These files were changed on the server AND you have local changes to them:\n  ") + FString::Join(Blockers, TEXT("\n  "))
+				+ TEXT("\nNothing was changed. Run Sync again: text files are merged automatically, and for assets you will be asked whether to keep your version or take theirs.")
+				+ TEXT("\n(If you deleted one of these files, Revert the delete first.)");
+		}
+		return Result.Describe();
+	}
+
+	// A small FLoreResult for a failure that happened before lore ran.
+	static FLoreResult MakeFailure(const FString& Message)
+	{
+		FLoreResult Result;
+		Result.bLaunched = true;
+		Result.ExitCode = 1;
+		Result.Output = Message;
+		return Result;
+	}
+
+	// `lore sync` stopped because of local changes (exit 39). Do what Perforce's
+	// "sync + resolve" does, for exactly the files Lore listed:
+	//   1. back up my version              -> Saved/LoreSourceControl/SyncBackups/<time>/<path>
+	//   2. `lore file reset` those files   -> the version we both started from (kept as <path>.base)
+	//   3. `lore sync`                     -> their version
+	//   4. text:  diff3 merges mine + theirs.  assets: keep mine or keep theirs (user chose earlier)
+	// My version is never deleted: if anything fails it is copied back.
+	static FLoreResult SyncResolvingLocalChanges(FLoreCommand& C, const TArray<FString>& Blockers, const FLoreResult& FirstAttempt)
+	{
+		struct FItem
+		{
+			FString Rel, Abs, Mine, Base;
+			bool bText = false;
+			bool bKeepMine = false;
+		};
+
+		// 1. Plan. If any file has no answer yet, change nothing.
+		TArray<FItem> Items;
+		TArray<FString> Undecided;
+		for (const FString& Rel : Blockers)
+		{
+			FItem Item;
+			Item.Rel = Rel;
+			Item.Abs = LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Rel);
+			Item.bText = LoreUtils::IsMergeableText(Rel);
+			Item.bKeepMine = C.ResolveKeepMine.Contains(Item.Abs);
+			const bool bDecided = Item.bText || Item.bKeepMine || C.ResolveTakeTheirs.Contains(Item.Abs);
+			if (!bDecided || !FPaths::FileExists(Item.Abs))
+			{
+				Undecided.Add(Rel);
+				continue;
+			}
+			Items.Add(Item);
+		}
+		if (Undecided.Num() > 0 || Items.Num() == 0)
+		{
+			return FirstAttempt; // RunSync explains which files and what to do
+		}
+
+		// From here on the user's files are being changed: finish no matter what.
+		const std::atomic<bool>* SavedFlag = C.Ctx.CancelFlag;
+		C.Ctx.CancelFlag = nullptr;
+		C.bPastPointOfNoReturn = true;
+
+		const FString BackupDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir())
+			/ TEXT("LoreSourceControl/SyncBackups") / FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S"));
+		IFileManager& FM = IFileManager::Get();
+
+		auto PutMineBack = [&C, &FM](const TArray<FItem>& ToRestore)
+		{
+			TArray<FString> RestoredRels;
+			for (const FItem& Item : ToRestore)
+			{
+				if (FM.Copy(*Item.Abs, *Item.Mine, true, true) != COPY_OK)
+				{
+					AddError(C, FString::Printf(TEXT("Could not put your version of %s back. It is saved here:\n  %s"), *Item.Rel, *Item.Mine));
+				}
+				RestoredRels.Add(Item.Rel);
+			}
+			RunChunked(C, { TEXT("dirty") }, RestoredRels, ShortTimeout, true);
+		};
+
+		// 2. Back up my version.
+		TArray<FString> Rels;
+		for (FItem& Item : Items)
+		{
+			Item.Mine = BackupDir / Item.Rel;
+			Item.Base = Item.Mine + TEXT(".base");
+			FM.MakeDirectory(*FPaths::GetPath(Item.Mine), true);
+			if (FM.Copy(*Item.Mine, *Item.Abs, true, true) != COPY_OK)
+			{
+				C.Ctx.CancelFlag = SavedFlag;
+				return MakeFailure(FString::Printf(TEXT("Could not back up %s to %s, so nothing was changed."), *Item.Rel, *Item.Mine));
+			}
+			Rels.Add(Item.Rel);
+		}
+		UE_LOG(LogLoreSC, Log, TEXT("Sync: backed up %d locally changed file(s) to %s"), Items.Num(), *BackupDir);
+
+		// 3. Throw away the local change of just these files (backed up above).
+		FString ResetError;
+		if (!RunChunked(C, { TEXT("file"), TEXT("reset") }, Rels, ShortTimeout, false, nullptr, &ResetError))
+		{
+			PutMineBack(Items);
+			C.Ctx.CancelFlag = SavedFlag;
+			return MakeFailure(TEXT("Could not set your changes aside (lore file reset failed), so your files were left as they were.\n") + ResetError);
+		}
+		for (FItem& Item : Items)
+		{
+			if (Item.bText)
+			{
+				FM.Copy(*Item.Base, *Item.Abs, true, true); // the version we both started from
+			}
+		}
+
+		// 4. Sync. Now nothing blocks it.
+		const FLoreResult Second = LoreUtils::Run(C.Ctx, { TEXT("sync") }, LongTimeout);
+		if (!Second.Ok())
+		{
+			PutMineBack(Items);
+			C.WarningMessages.Add(TEXT("The sync failed, so your versions were put back. Backups: ") + BackupDir);
+			C.Ctx.CancelFlag = SavedFlag;
+			return Second;
+		}
+
+		// 5. Combine: the file on disk is now their version.
+		TArray<FString> Merged, Conflicts, KeptMine, TookTheirs, NotMerged, NeedDirty;
+		bool bConfigChanged = false;
+		for (const FItem& Item : Items)
+		{
+			bConfigChanged |= FPaths::GetExtension(Item.Rel).Equals(TEXT("ini"), ESearchCase::IgnoreCase);
+			if (Item.bText)
+			{
+				const FString MergedFile = Item.Mine + TEXT(".merged");
+				FString MergeMessage;
+				const int32 Code = FM.FileExists(*Item.Base)
+					? LoreUtils::Merge3(Item.Mine, Item.Base, Item.Abs, MergedFile, MergeMessage)
+					: -1;
+				if ((Code == 0 || Code == 1) && FM.Copy(*Item.Abs, *MergedFile, true, true) == COPY_OK)
+				{
+					(Code == 0 ? Merged : Conflicts).Add(Item.Rel);
+					NeedDirty.Add(Item.Rel);
+				}
+				else
+				{
+					NotMerged.Add(FString::Printf(TEXT("%s  (yours: %s)%s"), *Item.Rel, *Item.Mine,
+						MergeMessage.IsEmpty() ? TEXT("") : *(TEXT("  ") + MergeMessage)));
+				}
+			}
+			else if (Item.bKeepMine)
+			{
+				if (FM.Copy(*Item.Abs, *Item.Mine, true, true) == COPY_OK)
+				{
+					KeptMine.Add(Item.Rel);
+					NeedDirty.Add(Item.Rel);
+				}
+				else
+				{
+					NotMerged.Add(FString::Printf(TEXT("%s  (yours: %s)"), *Item.Rel, *Item.Mine));
+				}
+			}
+			else
+			{
+				TookTheirs.Add(FString::Printf(TEXT("%s  (yours: %s)"), *Item.Rel, *Item.Mine));
+			}
+		}
+		if (NeedDirty.Num() > 0)
+		{
+			RunChunked(C, { TEXT("dirty") }, NeedDirty, ShortTimeout, true);
+		}
+
+		// 6. Tell the user exactly what happened.
+		FString Report;
+		auto Section = [&Report](const TArray<FString>& List, const TCHAR* Title)
+		{
+			if (List.Num() > 0)
+			{
+				Report += FString(Title) + TEXT("\n  ") + FString::Join(List, TEXT("\n  ")) + TEXT("\n");
+			}
+		};
+		Section(Merged, TEXT("Merged your changes with theirs:"));
+		Section(Conflicts, TEXT("CONFLICT - you both changed the same lines. Open these files and fix the parts between <<<<<<< and >>>>>>> before submitting:"));
+		Section(KeptMine, TEXT("Kept your version (submitting it replaces theirs):"));
+		Section(TookTheirs, TEXT("Took their version (yours is backed up):"));
+		Section(NotMerged, TEXT("Could not merge, so their version is on disk now (yours is backed up):"));
+		if (bConfigChanged)
+		{
+			Report += TEXT("Config files changed: restart the editor so it reads them.\n");
+		}
+		Report += TEXT("Backups of your versions: ") + BackupDir;
+		C.WarningMessages.Add(Report);
+
+		C.Ctx.CancelFlag = SavedFlag;
+		return Second;
+	}
+
+	// `lore sync` refuses while anything is staged ("Unable to sync when there
+	// is a staged state"), so set staged files aside, sync, and stage them
+	// again afterwards (moves are recorded again with `stage move`).
+	// bResolveLocalChanges: if local edits block the sync, merge them (see above).
+	static FLoreResult SyncPreservingStage(FLoreCommand& C, bool bResolveLocalChanges = false)
+	{
+		TArray<FString> Staged;
+		const FLoreResult Status = LoreUtils::Run(C.Ctx, { TEXT("status") }, ShortTimeout);
+		if (Status.Ok())
+		{
+			FLoreRepoInfo Info;
+			LoreUtils::ParseStatus(Status.Output, Info);
+			for (const FLoreStatusEntry& Entry : Info.Entries)
+			{
+				if (Entry.bStaged && !FPaths::DirectoryExists(LoreUtils::ToAbsolute(C.Ctx.RepoRoot, Entry.RelPath)))
+				{
+					Staged.AddUnique(Entry.RelPath);
+				}
+			}
+		}
+		if (Staged.Num() > 0)
+		{
+			RunChunked(C, { TEXT("unstage") }, Staged, ShortTimeout, true);
+		}
+
+		FLoreResult SyncResult = LoreUtils::Run(C.Ctx, { TEXT("sync") }, LongTimeout);
+		if (bResolveLocalChanges && !SyncResult.Ok() && !SyncResult.bCancelled)
+		{
+			const TArray<FString> Blockers = ParseSyncBlockers(SyncResult.Output);
+			if (Blockers.Num() > 0)
+			{
+				SyncResult = SyncResolvingLocalChanges(C, Blockers, SyncResult);
+			}
+		}
+
+		if (Staged.Num() > 0)
+		{
+			// Must run even if the sync was cancelled.
+			const std::atomic<bool>* SavedFlag = C.Ctx.CancelFlag;
+			C.Ctx.CancelFlag = nullptr;
+			TArray<FString> Plain;
+			for (const FString& Rel : Staged)
+			{
+				FString OldRel;
+				if (C.MoveStore.IsValid() && C.MoveStore->Find(Rel, OldRel))
+				{
+					StageMove(C, OldRel, Rel);
+				}
+				Plain.Add(Rel);
+			}
+			RunChunked(C, { TEXT("dirty") }, Plain, ShortTimeout, true);
+			RunChunked(C, { TEXT("stage") }, Plain, LongTimeout, true);
+			C.Ctx.CancelFlag = SavedFlag;
+		}
+		return SyncResult;
+	}
+
 	static bool RunCheckIn(FLoreCommand& C)
 	{
 		TArray<FString> Rels, Dirs;
@@ -1019,18 +1353,50 @@ namespace LoreWork
 
 		// 4. Push. If the server moved on, let it fast-forward merge when
 		//    the changes don't overlap.
-		const FLoreResult Push = LoreUtils::Run(C.Ctx, { TEXT("push"), TEXT("--fast-forward-merge") }, LongTimeout);
+		FLoreResult Push = LoreUtils::Run(C.Ctx, { TEXT("push"), TEXT("--fast-forward-merge") }, LongTimeout);
+		FString PushProblem;
+		if (!Push.Ok() && Push.Output.Contains(TEXT("Fast-forward merge has conflicts")))
+		{
+			// Someone else changed some of the same files. Merge their changes
+			// into ours locally (Lore does a 3-way merge), then push again.
+			UE_LOG(LogLoreSC, Log, TEXT("Submit: the server has changes to the same files, merging them in..."));
+			const FLoreResult Merge = SyncPreservingStage(C);
+			if (Merge.Ok())
+			{
+				Push = LoreUtils::Run(C.Ctx, { TEXT("push"), TEXT("--fast-forward-merge") }, LongTimeout);
+				if (Push.Ok())
+				{
+					C.WarningMessages.Add(TEXT("Someone else had changed some of the same files. Lore merged their changes into yours before submitting. If any of those files are open in the editor, reload them."));
+				}
+			}
+			else
+			{
+				PushProblem = TEXT("Someone else changed some of the same files, and merging their changes failed:\n") + DescribeSyncFailure(Merge);
+			}
+		}
 		if (!Push.Ok())
 		{
 			const FString Committed = NewRevision != INDEX_NONE ? FString::Printf(TEXT(" as revision %d"), NewRevision) : FString();
-			AddError(C, FString::Printf(TEXT("Your changes were committed locally%s, but uploading to the server failed. Your check-outs are kept.\nSync to get the latest revision, then submit again to upload the pending commit.\n\n%s"),
-				*Committed, *Push.Describe()));
+			AddError(C, FString::Printf(TEXT("Your changes were committed locally%s, but uploading to the server failed. Your check-outs are kept.\nFix the problem below, then Submit again to upload the pending commit.\n\n%s"),
+				*Committed, PushProblem.IsEmpty() ? *Push.Describe() : *PushProblem));
 			Restage();
 			TMap<FString, FLoreFileStatus> After;
 			RefreshFiles(C, Rels, After, true);
 			AddStatuses(C, After);
 			ReadRepoInfo(C);
 			return false;
+		}
+
+		// 4b. The server merged our commit with newer revisions. Update to that
+		//     merged revision now: otherwise the next commit fails ("branch has
+		//     been advanced") and a later push would upload this commit twice.
+		if (Push.Output.Contains(TEXT("fast-forward merged on server")))
+		{
+			const FLoreResult Update = SyncPreservingStage(C);
+			if (!Update.Ok())
+			{
+				C.WarningMessages.Add(TEXT("Submitted (merged with newer changes on the server), but could not update to the merged revision. Run Sync.\n") + DescribeSyncFailure(Update));
+			}
 		}
 
 		// 5. Only now release the locks (if this order were reversed, a failed
@@ -1077,6 +1443,7 @@ namespace LoreWork
 		RefreshFiles(C, Rels, After, true);
 		AddStatuses(C, After);
 		ReadRepoInfo(C);
+		UpdateOutOfDate(C);
 
 		C.SuccessMessage = NewRevision != INDEX_NONE
 			? FString::Printf(TEXT("Submitted revision %d to Lore."), NewRevision)
@@ -1087,7 +1454,7 @@ namespace LoreWork
 	static bool RunSync(FLoreCommand& C)
 	{
 		UE_LOG(LogLoreSC, Log, TEXT("Sync: downloading the latest revision..."));
-		const FLoreResult Result = LoreUtils::Run(C.Ctx, { TEXT("sync") }, LongTimeout);
+		const FLoreResult Result = SyncPreservingStage(C, /*bResolveLocalChanges=*/ true);
 		if (Result.bCancelled)
 		{
 			// Refresh what we can without the cancel flag, so icons are right.
@@ -1097,13 +1464,27 @@ namespace LoreWork
 		}
 		if (!Result.Ok())
 		{
-			AddError(C, TEXT("lore sync failed:\n") + Result.Describe());
+			AddError(C, TEXT("Sync did not finish.\n") + DescribeSyncFailure(Result));
 		}
 		else
 		{
 			C.InfoMessages.Add(TEXT("Synced to the latest revision. (Lore always syncs the whole branch, not single files.)"));
+
+			// A Submit whose upload failed earlier leaves a commit that only
+			// exists here (the sync just merged it with the server). Upload it.
+			const FLoreResult Upload = LoreUtils::Run(C.Ctx, { TEXT("push"), TEXT("--fast-forward-merge") }, LongTimeout);
+			if (Upload.Ok() && Upload.Output.Contains(TEXT("Pushed revision")))
+			{
+				C.WarningMessages.Add(TEXT("Uploaded a submit that had not reached the server yet (it was merged with the latest changes)."));
+				if (Upload.Output.Contains(TEXT("fast-forward merged on server")))
+				{
+					SyncPreservingStage(C);
+				}
+			}
 		}
 		GatherStatus(C);
+		ReadRepoInfo(C);
+		UpdateOutOfDate(C);
 		return Result.Ok();
 	}
 
@@ -1234,6 +1615,7 @@ namespace LoreWork
 	{
 		const bool bOk = ReadRepoInfo(C);
 		QueryAllLocks(C);
+		UpdateOutOfDate(C);
 		return bOk;
 	}
 }

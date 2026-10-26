@@ -15,7 +15,9 @@
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Logging/MessageLog.h"
+#include "Misc/App.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/MessageDialog.h"
 #include "CoreGlobals.h"
 #include "Misc/Paths.h"
 #include "Misc/QueuedThreadPool.h"
@@ -436,6 +438,13 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 	else if (OpName == LoreOpNames::Sync)
 	{
 		Command->SyncRevision = StaticCastSharedRef<FSync>(InOperation)->GetRevision();
+		if (Command->SyncRevision.IsEmpty() && !ChooseSyncResolutions(*Command))
+		{
+			delete Command;
+			InOperation->AddInfoMessge(LOCTEXT("SyncCancelled", "Sync cancelled. Nothing was changed."));
+			InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Cancelled);
+			return ECommandResult::Cancelled;
+		}
 	}
 	else if (OpName == LoreOpNames::UpdateStatus)
 	{
@@ -476,6 +485,58 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(
 	CommandQueue.Add(Command);
 	GetWorkerPool()->AddQueuedWork(Command);
 	return ECommandResult::Succeeded;
+}
+
+bool FLoreSourceControlProvider::ChooseSyncResolutions(FLoreCommand& Command) const
+{
+	// Changed here (Modified) AND newer on the server (out of date).
+	// Text files are merged automatically, so only assets need an answer.
+	TArray<FString> Assets;
+	for (const TPair<FString, TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>>& Pair : StateCache)
+	{
+		if (Pair.Value->WorkingState == ELoreWorkingState::Modified
+			&& OutOfDateFiles.Contains(Pair.Key)
+			&& !LoreUtils::IsMergeableText(Pair.Key))
+		{
+			Assets.Add(Pair.Key);
+		}
+	}
+	if (Assets.Num() == 0)
+	{
+		return true;
+	}
+	Assets.Sort();
+
+	EAppReturnType::Type Answer = EAppReturnType::No; // unattended: take theirs, mine is backed up
+	if (!FApp::IsUnattended())
+	{
+		FString List;
+		for (const FString& Abs : Assets)
+		{
+			FString Rel;
+			List += TEXT("    ") + (LoreUtils::ToRelative(RepoRoot, Abs, Rel) ? Rel : Abs) + TEXT("\n");
+		}
+		Answer = FMessageDialog::Open(EAppMsgType::YesNoCancel,
+			FText::Format(LOCTEXT("SyncBothChanged",
+				"Someone else submitted a newer version of assets that you have also changed:\n\n{0}\n"
+				"Assets can't be merged, so pick which version to keep:\n\n"
+				"Yes  =  Keep mine. Your version stays. When you submit it, it replaces theirs.\n"
+				"No  =  Take theirs. Their version is synced. Yours is backed up in Saved/LoreSourceControl/SyncBackups.\n"
+				"Cancel  =  Don't sync.\n\n"
+				"(Changed text files like .ini are merged automatically.)"),
+				FText::FromString(List)),
+			LOCTEXT("SyncBothChangedTitle", "Sync - changed on both sides"));
+	}
+
+	if (Answer == EAppReturnType::Cancel)
+	{
+		return false;
+	}
+	for (const FString& Abs : Assets)
+	{
+		(Answer == EAppReturnType::Yes ? Command.ResolveKeepMine : Command.ResolveTakeTheirs).Add(Abs);
+	}
+	return true;
 }
 
 void FLoreSourceControlProvider::ProcessFinishedQueue()
@@ -571,8 +632,28 @@ void FLoreSourceControlProvider::ApplyResults(FLoreCommand& Command)
 	TSet<FString> Reported;
 	for (const FLoreFileStatus& Status : Command.Statuses)
 	{
-		GetStateInternal(Status.AbsPath)->ApplyStatus(Status);
+		TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> State = GetStateInternal(Status.AbsPath);
+		State->ApplyStatus(Status);
+		if (OutOfDateFiles.Contains(Status.AbsPath))
+		{
+			State->bIsCurrent = false; // a per-file refresh must not hide "newer version on server"
+		}
 		Reported.Add(Status.AbsPath);
+	}
+
+	// Files changed on the server since our revision (complete list).
+	if (Command.bHasOutOfDate)
+	{
+		OutOfDateFiles.Reset();
+		OutOfDateFiles.Append(Command.OutOfDateFiles);
+		for (const FString& Path : OutOfDateFiles)
+		{
+			GetStateInternal(Path); // so the icon and Sync show even before the editor asks
+		}
+		for (TPair<FString, TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>>& Pair : StateCache)
+		{
+			Pair.Value->bIsCurrent = !OutOfDateFiles.Contains(Pair.Key);
+		}
 	}
 
 	// A full scan of a folder lists every changed file in it. Anything we

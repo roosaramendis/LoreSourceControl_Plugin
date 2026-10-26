@@ -116,6 +116,8 @@ struct FLoreRepoInfo
 	FString BranchName;
 	TOptional<int32> LocalRevision;
 	TOptional<int32> RemoteRevision;
+	FString LocalHash;   // "On branch main revision 25 -> <hash>"
+	FString RemoteHash;  // "Remote revision 34 -> <hash>"
 	TArray<FLoreStatusEntry> Entries;
 };
 
@@ -162,5 +164,18 @@ namespace LoreUtils
 	TOptional<int32> ParseFirstHistoryRevision(const FString& Output);
 	TOptional<int32> ParseCommittedRevision(const FString& Output);
 	void ParseFileHistory(const FString& Output, TArray<FLoreHistoryEntry>& OutEntries);
+	void ParseRevisionDiff(const FString& Output, TArray<FString>& OutRelPaths); // "M path" lines; moves give both paths
 	FDateTime ParseLoreDate(const FString& Text); // "Sat, 17 Oct 2026 09:35:42 +0000" -> UTC
+
+	// Text files (.ini, .json, source code...) can be merged line by line.
+	// Everything else (.uasset, .umap, images...) can't.
+	bool IsMergeableText(const FString& Path);
+
+	// Three-way merge with the system `diff3` tool:
+	//   Base   = the version both people started from
+	//   Mine   = my local edit,  Theirs = the version from the server
+	// Writes the result to OutFile. Returns diff3's exit code:
+	//   0 = merged cleanly, 1 = merged with conflict markers (<<<<<<< ... >>>>>>>),
+	//   anything else = could not merge (diff3 missing, binary file...).
+	int32 Merge3(const FString& Mine, const FString& Base, const FString& Theirs, const FString& OutFile, FString& OutMessage);
 }

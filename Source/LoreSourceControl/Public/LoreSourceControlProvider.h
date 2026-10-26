@@ -99,6 +99,10 @@ private:
 
 	void HandleAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath);
 
+	// Before a Sync: assets changed both locally and on the server can't be
+	// merged, so ask "keep mine / take theirs". False = the user cancelled.
+	bool ChooseSyncResolutions(FLoreCommand& Command) const;
+
 	TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& AbsPath);
 	void ApplyResults(FLoreCommand& Command);
 	ECommandResult::Type ProcessCompletedCommand(FLoreCommand& Command);
@@ -128,6 +132,7 @@ private:
 	double LastRefreshTime = 0.0;
 
 	TMap<FString, TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>> StateCache;
+	TSet<FString> OutOfDateFiles; // absolute paths with a newer version on the server
 
 	// Async commands waiting for Tick() to pick up their results.
 	TArray<FLoreCommand*> CommandQueue;
